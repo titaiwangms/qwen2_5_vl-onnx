@@ -263,6 +263,68 @@ class Qwen2_5_VLVisionAttention(nn.Module):
                 )
             # ONNX symbolic outputs default to CPU; move to projection weight device to prevent mixed-device addmm during torch.export
             attn_output = attn_output.to(self.proj.weight.device)
+        elif torch.compiler.is_exporting():
+            # maybe needed
+            # attention_interface = patched_sdpa_attention_forward
+
+            class patched_Qwen2_5_VLVisionAttentionOneIteration(torch.nn.Module):
+                def forward(
+                    self,
+                    start_end,
+                    query_states,
+                    key_states,
+                    value_states,
+                    scaling: float = 1.0,
+                    dropout: float = 0.0,
+                    **kwargs,
+                ):
+                    a = start_end[0].item()
+                    b = start_end[1].item()
+                    q = query_states[:, :, a:b, :]
+                    k = key_states[:, :, a:b, :]
+                    v = value_states[:, :, a:b, :]
+                    return attention_interface(
+                        self,
+                        q,
+                        k,
+                        v,
+                        attention_mask=None,
+                        scaling=scaling,
+                        dropout=dropout,
+                        is_causal=False,
+                        **kwargs,
+                    )[0]
+
+            def _iteration(start_end, query_states, key_states, value_states):
+                return patched_Qwen2_5_VLVisionAttentionOneIteration.forward(
+                    self,
+                    start_end,
+                    query_states,
+                    key_states,
+                    value_states,
+                    scaling=self.scaling,
+                    dropout=0.0 if not self.training else self.attention_dropout,
+                )
+
+            starts = cu_seqlens[:-1]
+            ends = cu_seqlens[1:]
+            # cu_seqlens = [0, 10, 14, 27]
+            # starts: [0, 10, 14]
+            # ends: [10, 14, 17]
+            # starts_ends: [[0, 10], [10, 14], [14, 27]]
+            starts_ends = torch.cat([starts.unsqueeze(1), ends.unsqueeze(1)], dim=1)
+            attn_outputs = [
+                _iteration(start_end, query_states, key_states, value_states)
+                for start_end in starts_ends
+            ]
+            # attn_outputs = torch._higher_order_ops.while_loop(
+            # attn_outputs = torch.ops.higher_order.while_loop(
+            #    (lambda it, starts_ends, *_args: it < starts_ends.shape[0]),
+            #    _iteration,
+            #    (torch.tensor(0),
+            #       starts_ends, query_states, key_states, value_states), tuple(),
+            # )
+            attn_output = torch.cat(attn_outputs, dim=1)
         else:
             # Other implementations: Process each chunk separately
             lengths = cu_seqlens[1:] - cu_seqlens[:-1]
