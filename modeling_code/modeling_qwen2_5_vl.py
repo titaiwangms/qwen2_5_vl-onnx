@@ -235,35 +235,6 @@ class Qwen2_5_VLVisionAttention(nn.Module):
                 **kwargs,
             )
         elif torch.compiler.is_exporting():
-            # TODO(titaiwang): How to use GQA on this?
-            # Specifically, window attention and global attention mechanism needs to be manually
-            # broke down into QKV, so GQA would not need to take cu_seqlens.
-            max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max()
-            attn_output = torch.onnx.ops.symbolic(
-                    "custom::qwen25_attention",
-                    (
-                        query_states,
-                        key_states,
-                        value_states,
-                        cu_seqlens,
-                        cu_seqlens,
-                        max_seqlen,
-                        max_seqlen,
-                        # Ensure the scaling constant is created on the same device to avoid CPU/CUDA mixing during export
-                        torch.tensor(self.scaling, dtype=torch.float32, device=query_states.device),
-                    ),
-                    dtype=query_states.dtype,
-                    shape=(
-                        key_states.shape[0],
-                        value_states.shape[1],
-                        max_seqlen,
-                        value_states.shape[-1],
-                    ),
-                    version=1,
-                )
-            # ONNX symbolic outputs default to CPU; move to projection weight device to prevent mixed-device addmm during torch.export
-            attn_output = attn_output.to(self.proj.weight.device)
-        elif torch.compiler.is_exporting():
             # maybe needed
             # attention_interface = patched_sdpa_attention_forward
 
@@ -1309,6 +1280,58 @@ class Qwen2_5_VLModel(Qwen2_5_VLPreTrainedModel):
         split_sizes = (image_grid_thw.prod(-1) // self.visual.spatial_merge_size**2).tolist()
         image_embeds = torch.split(image_embeds, split_sizes)
         return image_embeds
+
+    def get_fused_input_embeddings(self, input_ids, image_features=None):
+        """
+        Fuses the input embeddings from the language model with the image features.
+
+        Args:
+            input_ids (`torch.LongTensor`): The input IDs for the language model.
+            image_features (`torch.FloatTensor`, optional): The image features to fuse with the input embeddings.
+
+        Returns:
+            `torch.FloatTensor`: The fused input embeddings.
+        """
+        def true_fn_for_input_ids(input_ids):
+            special_image_mask = input_ids == self.config.image_token_id
+            llm_input_ids = input_ids.clone()
+            llm_input_ids[special_image_mask] = 0
+            return input_ids
+        def false_fn_for_input_ids(input_ids):
+            return input_ids
+        
+        # condition 1 on the image token index
+        llm_input_ids = torch.cond(
+            input_ids is not None and self.config.image_token_id >= self.config.text_config.vocab_size,
+            true_fn_for_input_ids,
+            false_fn_for_input_ids,
+            (input_ids, )
+        )
+    
+        inputs_embeds = self.language_model.get_input_embeddings()(llm_input_ids)
+
+        def image_features_is_none(inputs_embeds, image_features=None):
+            return inputs_embeds
+        
+        def image_features_is_not_none(inputs_embeds, image_features=None):
+            # input_ids: [batch_size, seq_len]
+            # input_embeds: [batch_size, seq_len, 2560 (hidden_size)]
+            special_image_mask = (llm_input_ids == self.config.image_token_id).unsqueeze(-1)
+            special_image_mask = special_image_mask.expand_as(inputs_embeds).to(inputs_embeds.device)
+
+            image_features = image_features.to(inputs_embeds.device, inputs_embeds.dtype)
+            inputs_embeds = inputs_embeds.masked_scatter(special_image_mask, image_features)
+            return inputs_embeds
+        
+        # condition 2 on the image features
+        inputs_embeds = torch.cond(
+            image_features is None,
+            image_features_is_none,
+            image_features_is_not_none,
+            (inputs_embeds, image_features,)
+        )
+
+        return inputs_embeds
 
     def get_placeholder_mask(
         self,

@@ -4,8 +4,9 @@ import subprocess
 import sys
 import torch
 
-from onnxruntime_genai.models.builder import create_model
+from onnxscript.rewriter import ort_fusions
 from transformers import Qwen2_5_VLConfig, AutoModel
+from torch.onnx._internal.exporter import _testing
 
 
 def build_vision(args):
@@ -43,17 +44,22 @@ def build_vision(args):
             opset_version=22,
         )
 
+    _testing.assert_onnx_program(vision_onnx_program)
+
+    # apply ort_fusions
+    vision_onnx_program.model, optimized_count = ort_fusions.optimize_for_ort(vision_onnx_program.model)
+    print("ORT optimized fusion counts:", optimized_count)
+    
     # Restore original forward method
     model.get_image_features, model.forward = model.forward, model.get_image_features
 
     # Save the ONNX model
-    filename = "qwen-2_5-vision.onnx"
+    filename = "qwen2_5_vl-vision.onnx"
     vision_init_export = os.path.join(args.output, "vision_init_export")
     os.makedirs(vision_init_export, exist_ok=True)
     vision_path = os.path.join(vision_init_export, filename)
     vision_onnx_program.save(vision_path, external_data=True)
 
-    # TODO(titaiwang): Try ort_fusion
     # ORT transformer optimizer
     vision_after_opt = os.path.join(args.output, "vision_after_opt")
     vision_opt_path = os.path.join(vision_after_opt, filename)
@@ -85,33 +91,40 @@ def build_vision(args):
     subprocess.run(cmd)
     # shutil.rmtree(vision_after_opt)
 
-# TODO(titaiwang): Check embedding model export
+    # TODO(titaiwang): We probably need to change output dimension name for image_features
+    # to match embedding model input.
+
 def build_embedding(args):
     # Dynamo export
-    batch_size, sequence_length, num_img_tokens, image_length = 2, 268, 2, 256
+    # assume 2 batches, each with 1 image input (3577 logical patches)
+    batch_size, sequence_length, patches_per_image, out_hidden_size = 2, 3606, 3577, 3584
+    num_logical_patches = batch_size * patches_per_image
     inputs = {
-        "input_ids": torch.randint(low=0, high=config.image_token_index, size=(batch_size, sequence_length), device=args.execution_provider.replace("dml", "cuda"), dtype=torch.int64),
-        "image_features": torch.randn(num_img_tokens, image_length, config.text_config.hidden_size, device=args.execution_provider.replace("dml", "cuda"), dtype=args.precision),
+        "input_ids": torch.randint(low=0, high=config.image_token_id, size=(batch_size, sequence_length), device=args.execution_provider.replace("dml", "cuda"), dtype=torch.int64),
+        "image_features": torch.randn(num_logical_patches, out_hidden_size, device=args.execution_provider.replace("dml", "cuda"), dtype=args.precision),
     }
     
+    img_start_index = 3
+    img_end_index = img_start_index + patches_per_image # 3 + 3577 = 3580
+
     # Fill in with image token index
-    inputs["input_ids"][0][2] = config.boi_token_index  # <start_of_image>
-    inputs["input_ids"][0][3:255] = config.image_token_index # <image>
-    inputs["input_ids"][0][255] = config.eoi_token_index  # <end_of_image>
-    
-    inputs["input_ids"][1][2] = config.boi_token_index  # <start_of_image>
-    inputs["input_ids"][1][3:255] = config.image_token_index # <image>
-    inputs["input_ids"][1][255] = config.eoi_token_index  # <end_of_image>
-    
+    inputs["input_ids"][0][2] = config.bos_token_id  # <start_of_image>
+    inputs["input_ids"][0][img_start_index:img_end_index] = config.image_token_id # <image>
+    inputs["input_ids"][0][img_end_index] = config.eos_token_id  # <end_of_image>
+
+    inputs["input_ids"][1][2] = config.bos_token_id  # <start_of_image>
+    inputs["input_ids"][1][img_start_index:img_end_index] = config.image_token_id # <image>
+    inputs["input_ids"][1][img_end_index] = config.eos_token_id  # <end_of_image>
+
     dummy_inputs = (
         inputs["input_ids"],      # input_ids: torch.LongTensor
         inputs["image_features"], # image_features: Optional[torch.FloatTensor] = None,
     )
     dynamic_shapes = {
         "input_ids": {0: "batch_size", 1: "sequence_length"},
-        "image_features": {0: "num_images", 1: "image_length"},
+        "image_features": {0: "num_logical_patches"},
     }
-    
+        
     # NOTE: hack to embedding model export
     model.get_fused_input_embeddings, model.forward = model.forward, model.get_fused_input_embeddings
     
@@ -127,28 +140,18 @@ def build_embedding(args):
             opset_version=22,
         )
 
+    _testing.assert_onnx_program(embedding_onnx_program)
+
     # Restore original forward method
     model.get_fused_input_embeddings, model.forward = model.forward, model.get_fused_input_embeddings
 
     # Save the ONNX model
-    filename = "gemma-3-embedding.onnx"
+    os.makedirs(args.output, exist_ok=True)
+    filename = "qwen2_5_vl-embedding.onnx"
     fpath_1 = os.path.join(args.output, filename)
     embedding_onnx_program.save(fpath_1, external_data=True)
 
-def build_text(args):
-    # Create ONNX model
-    model_name = None
-    precision = "int4"
-    extra_options = {
-        "exclude_embeds": "true",
-        "filename": "gemma-3-text.onnx",
-    }
-    if args.precision == torch.float32:
-        extra_options["int4_accuracy_level"] = 4
-    create_model(model_name, args.input, args.output, precision, args.execution_provider, args.cache_dir, **extra_options)
-
-
-def build_apply_multimodal_rotary_pos_emb(args):
+def build_mrope(args):
         import transformers
         apply_multimodal_rotary_pos_emb = (
             transformers.models.qwen2_5_vl.modeling_qwen2_5_vl.apply_multimodal_rotary_pos_emb
@@ -157,23 +160,23 @@ def build_apply_multimodal_rotary_pos_emb(args):
         class Model(torch.nn.Module):
             def forward(self, q, k, cos, sin):
                 return apply_multimodal_rotary_pos_emb(q, k, cos, sin, [16, 24, 24])
-
-        dtype = getattr(torch, args.precision)
+        dtype = args.precision
         inputs = (
-            torch.rand((1, 16, 348, 128), dtype=dtype),
-            torch.rand((1, 2, 348, 128), dtype=dtype),
-            torch.rand((3, 1, 348, 128), dtype=dtype),
-            torch.rand((3, 1, 348, 128), dtype=dtype),
+            torch.rand((1, 28, 3606, 128), dtype=dtype),  # q
+            torch.rand((1, 4, 3606, 128), dtype=dtype),  # k
+            torch.rand((3, 1, 3606, 128), dtype=dtype),  # cos
+            torch.rand((3, 1, 3606, 128), dtype=dtype),  # sin
         )
         model = Model()
         ds = (
-            {0: "a", 1: "b", 2: "c"},
-            {0: "a", 1: "e", 2: "c"},
-            {2: "c"},
-            {2: "c"},
+            {0: "batch_size", 2: "seq_length"},  # q
+            {0: "batch_size", 2: "seq_length"},  # k
+            {1: "batch_size", 2: "seq_length"},  # cos
+            {1: "batch_size", 2: "seq_length"},  # sin
         )
         epo = torch.onnx.export(model, inputs, dynamic_shapes=ds)
-        epo.save("apply_multimodal_rotary_pos_emb.onnx")
+        _testing.assert_onnx_program(epo)
+        epo.save("mrope.onnx")
 
 
 def get_args():
@@ -219,8 +222,8 @@ def get_args():
     parser.add_argument(
         "--part",
         required=False,
-        default="vision",
-        help="embedding, vision, or multi",
+        default="all",
+        help="embedding, vision, or mrope",
     )
 
     args = parser.parse_args()
@@ -235,14 +238,18 @@ def get_args():
 
 if __name__ == "__main__":
     args = get_args()
-    config = Qwen2_5_VLConfig.from_pretrained(args.input)
-    model = AutoModel.from_pretrained(args.input, attn_implementation="sdpa", trust_remote_code=True, torch_dtype=args.precision).to(args.execution_provider.replace("dml", "cuda"))
-    # Build model components
-    if args.part == "embedding":
-        build_embedding(args)
-    elif args.part == "multi":
-        build_apply_multimodal_rotary_pos_emb()
+    
+    if args.part == "mrope":
+        build_mrope(args)
     else:
-        build_vision(args)
-    # 
-    # build_text(args)
+        config = Qwen2_5_VLConfig.from_pretrained(args.input)
+        model = AutoModel.from_pretrained(args.input, attn_implementation="sdpa", trust_remote_code=True, torch_dtype=args.precision).to(args.execution_provider.replace("dml", "cuda"))
+        
+        # Build model components
+        if args.part == "embedding":
+            build_embedding(args)
+        elif args.part == "vision":
+            build_vision(args)
+        else:
+            build_embedding(args)
+            build_vision(args)
