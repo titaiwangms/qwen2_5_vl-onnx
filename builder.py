@@ -1,6 +1,5 @@
 import argparse
 import os
-import shutil
 import subprocess
 import sys
 import torch
@@ -81,7 +80,8 @@ def build_vision(args):
         "--output_model", vision_final_path,
         "--block_size", str(32),
     ]
-    if args.precision == torch.float32: cmd.extend(["--accuracy_level", str(4)])
+    if args.precision == torch.float32:
+        cmd.extend(["--accuracy_level", str(4)])
     subprocess.run(cmd)
     # shutil.rmtree(vision_after_opt)
 
@@ -143,7 +143,8 @@ def build_text(args):
         "exclude_embeds": "true",
         "filename": "gemma-3-text.onnx",
     }
-    if args.precision == torch.float32: extra_options["int4_accuracy_level"] = 4
+    if args.precision == torch.float32:
+        extra_options["int4_accuracy_level"] = 4
     create_model(model_name, args.input, args.output, precision, args.execution_provider, args.cache_dir, **extra_options)
 
 
