@@ -6,6 +6,7 @@ import torch
 
 from onnxscript.rewriter import ort_fusions
 from transformers import Qwen2_5_VLConfig, AutoModel
+from torch.onnx._internal.exporter import _testing
 
 
 def build_vision(args):
@@ -42,6 +43,8 @@ def build_vision(args):
             optimize=True,
             opset_version=22,
         )
+
+    _testing.assert_onnx_program(vision_onnx_program)
 
     # apply ort_fusions
     vision_onnx_program.model, optimized_count = ort_fusions.optimize_for_ort(vision_onnx_program.model)
@@ -93,15 +96,17 @@ def build_vision(args):
 
 def build_embedding(args):
     # Dynamo export
-    batch_size, sequence_length, num_logical_patches, out_hidden_size = 2, 3606, 3577, 3584
+    # assume 2 batches, each with 1 image input (3577 logical patches)
+    batch_size, sequence_length, patches_per_image, out_hidden_size = 2, 3606, 3577, 3584
+    num_logical_patches = batch_size * patches_per_image
     inputs = {
         "input_ids": torch.randint(low=0, high=config.image_token_id, size=(batch_size, sequence_length), device=args.execution_provider.replace("dml", "cuda"), dtype=torch.int64),
         "image_features": torch.randn(num_logical_patches, out_hidden_size, device=args.execution_provider.replace("dml", "cuda"), dtype=args.precision),
     }
     
     img_start_index = 3
-    img_end_index = img_start_index + num_logical_patches # 3 + 3577 = 3580
-    
+    img_end_index = img_start_index + patches_per_image # 3 + 3577 = 3580
+
     # Fill in with image token index
     inputs["input_ids"][0][2] = config.bos_token_id  # <start_of_image>
     inputs["input_ids"][0][img_start_index:img_end_index] = config.image_token_id # <image>
@@ -119,7 +124,7 @@ def build_embedding(args):
         "input_ids": {0: "batch_size", 1: "sequence_length"},
         "image_features": {0: "num_logical_patches"},
     }
-    
+        
     # NOTE: hack to embedding model export
     model.get_fused_input_embeddings, model.forward = model.forward, model.get_fused_input_embeddings
     
@@ -134,6 +139,8 @@ def build_embedding(args):
             optimize=True,
             opset_version=22,
         )
+
+    _testing.assert_onnx_program(embedding_onnx_program)
 
     # Restore original forward method
     model.get_fused_input_embeddings, model.forward = model.forward, model.get_fused_input_embeddings
@@ -157,8 +164,8 @@ def build_mrope(args):
         inputs = (
             torch.rand((1, 28, 3606, 128), dtype=dtype),  # q
             torch.rand((1, 4, 3606, 128), dtype=dtype),  # k
-            torch.rand((3, 1, 348, 128), dtype=dtype),  # cos
-            torch.rand((3, 1, 348, 128), dtype=dtype),  # sin
+            torch.rand((3, 1, 3606, 128), dtype=dtype),  # cos
+            torch.rand((3, 1, 3606, 128), dtype=dtype),  # sin
         )
         model = Model()
         ds = (
@@ -168,6 +175,7 @@ def build_mrope(args):
             {1: "batch_size", 2: "seq_length"},  # sin
         )
         epo = torch.onnx.export(model, inputs, dynamic_shapes=ds)
+        _testing.assert_onnx_program(epo)
         epo.save("mrope.onnx")
 
 
