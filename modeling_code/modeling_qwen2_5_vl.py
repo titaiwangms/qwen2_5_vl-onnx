@@ -178,6 +178,7 @@ def eager_attention_forward(
 
     return attn_output, attn_weights
 
+_attention_version = "bigmask"
 
 class Qwen2_5_VLVisionAttention(nn.Module):
     def __init__(self, config: Qwen2_5_VLVisionConfig) -> None:
@@ -234,7 +235,7 @@ class Qwen2_5_VLVisionAttention(nn.Module):
                 is_causal=False,
                 **kwargs,
             )
-        elif torch.compiler.is_exporting():
+        elif torch.compiler.is_exporting() and _attention_version == "custom":
             # TODO(titaiwang): How to use GQA on this?
             # Specifically, window attention and global attention mechanism needs to be manually
             # broke down into QKV, so GQA would not need to take cu_seqlens.
@@ -263,7 +264,7 @@ class Qwen2_5_VLVisionAttention(nn.Module):
                 )
             # ONNX symbolic outputs default to CPU; move to projection weight device to prevent mixed-device addmm during torch.export
             attn_output = attn_output.to(self.proj.weight.device)
-        elif torch.compiler.is_exporting():
+        elif torch.compiler.is_exporting() and _attention_version == "loop":
             # maybe needed
             # attention_interface = patched_sdpa_attention_forward
 
@@ -325,6 +326,33 @@ class Qwen2_5_VLVisionAttention(nn.Module):
             #       starts_ends, query_states, key_states, value_states), tuple(),
             # )
             attn_output = torch.cat(attn_outputs, dim=1)
+        elif torch.compiler.is_exporting() and _attention_version == "bigmask":
+            # make square mask
+            indices = torch.arange(
+                cu_seqlens.max(), dtype=cu_seqlens.dtype, device=cu_seqlens.device
+            )
+            dot = (cu_seqlens.unsqueeze(1) <= indices.unsqueeze(0)).to(
+                cu_seqlens.dtype
+            )
+            dot = dot.sum(dim=0)
+            mask = dot.unsqueeze(1) @ dot.unsqueeze(0)
+            bool_mask = mask == dot**2
+            bool_mask = bool_mask.unsqueeze(0).unsqueeze(0)
+
+            torch._check(bool_mask.shape[2] == key_states.shape[2])
+            torch._check(bool_mask.shape[3] == key_states.shape[2])
+
+            attn_output, _ = attention_interface(
+                self,
+                query_states,
+                key_states,
+                value_states,
+                attention_mask=bool_mask,
+                scaling=self.scaling,
+                dropout=0.0 if not self.training else self.attention_dropout,
+                is_causal=False,
+                **kwargs,
+            )
         else:
             # Other implementations: Process each chunk separately
             lengths = cu_seqlens[1:] - cu_seqlens[:-1]
