@@ -147,6 +147,34 @@ def build_text(args):
     create_model(model_name, args.input, args.output, precision, args.execution_provider, args.cache_dir, **extra_options)
 
 
+def build_apply_multimodal_rotary_pos_emb(args):
+        import transformers
+        apply_multimodal_rotary_pos_emb = (
+            transformers.models.qwen2_5_vl.modeling_qwen2_5_vl.apply_multimodal_rotary_pos_emb
+        )
+
+        class Model(torch.nn.Module):
+            def forward(self, q, k, cos, sin):
+                return apply_multimodal_rotary_pos_emb(q, k, cos, sin, [16, 24, 24])
+
+        dtype = getattr(torch, args.precision)
+        inputs = (
+            torch.rand((1, 16, 348, 128), dtype=dtype),
+            torch.rand((1, 2, 348, 128), dtype=dtype),
+            torch.rand((3, 1, 348, 128), dtype=dtype),
+            torch.rand((3, 1, 348, 128), dtype=dtype),
+        )
+        model = Model()
+        ds = (
+            {0: "a", 1: "b", 2: "c"},
+            {0: "a", 1: "e", 2: "c"},
+            {2: "c"},
+            {2: "c"},
+        )
+        epo = torch.onnx.export(model, inputs, dynamic_shapes=ds)
+        epo.save("apply_multimodal_rotary_pos_emb.onnx")
+
+
 def get_args():
     parser = argparse.ArgumentParser()
 
@@ -187,6 +215,12 @@ def get_args():
         default=os.path.join('.', 'cache_dir'),
         help="Cache directory for Hugging Face files and temporary ONNX external data files",
     )
+    parser.add_argument(
+        "--part",
+        required=False,
+        default="vision",
+        help="embedding, vision, or multi",
+    )
 
     args = parser.parse_args()
     mapping = {
@@ -197,11 +231,17 @@ def get_args():
     args.precision = mapping[args.precision]
     return args
 
+
 if __name__ == "__main__":
     args = get_args()
     config = Qwen2_5_VLConfig.from_pretrained(args.input)
     model = AutoModel.from_pretrained(args.input, attn_implementation="sdpa", trust_remote_code=True, torch_dtype=args.precision).to(args.execution_provider.replace("dml", "cuda"))
     # Build model components
-    build_vision(args)
-    # build_embedding(args)
+    if args.part == "embedding":
+        build_embedding(args)
+    elif args.part == "multi":
+        build_apply_multimodal_rotary_pos_emb()
+    else:
+        build_vision(args)
+    # 
     # build_text(args)
