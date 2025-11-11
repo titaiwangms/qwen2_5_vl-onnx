@@ -235,67 +235,34 @@ class Qwen2_5_VLVisionAttention(nn.Module):
                 **kwargs,
             )
         elif torch.compiler.is_exporting():
-            # maybe needed
-            # attention_interface = patched_sdpa_attention_forward
+            # make square mask
+            indices = torch.arange(
+                cu_seqlens.max(), dtype=cu_seqlens.dtype, device=cu_seqlens.device
+            )
+            dot = (cu_seqlens.unsqueeze(1) <= indices.unsqueeze(0)).to(
+                cu_seqlens.dtype
+            )
+            dot = dot.sum(dim=0).to(query_states.dtype)
+            mask = dot.unsqueeze(1) @ dot.unsqueeze(0)
+            bool_mask = mask == dot**2
+            bool_mask = bool_mask.unsqueeze(0).unsqueeze(0)
+            if bool_mask.device != query_states.device:
+                bool_mask = bool_mask.to(query_states.device)
 
-            class patched_Qwen2_5_VLVisionAttentionOneIteration(torch.nn.Module):
-                def forward(
-                    self,
-                    start_end,
-                    query_states,
-                    key_states,
-                    value_states,
-                    scaling: float = 1.0,
-                    dropout: float = 0.0,
-                    **kwargs,
-                ):
-                    a = start_end[0].item()
-                    b = start_end[1].item()
-                    q = query_states[:, :, a:b, :]
-                    k = key_states[:, :, a:b, :]
-                    v = value_states[:, :, a:b, :]
-                    return attention_interface(
-                        self,
-                        q,
-                        k,
-                        v,
-                        attention_mask=None,
-                        scaling=scaling,
-                        dropout=dropout,
-                        is_causal=False,
-                        **kwargs,
-                    )[0]
+            torch._check(bool_mask.shape[2] == key_states.shape[2])
+            torch._check(bool_mask.shape[3] == key_states.shape[2])
 
-            def _iteration(start_end, query_states, key_states, value_states):
-                return patched_Qwen2_5_VLVisionAttentionOneIteration.forward(
-                    self,
-                    start_end,
-                    query_states,
-                    key_states,
-                    value_states,
-                    scaling=self.scaling,
-                    dropout=0.0 if not self.training else self.attention_dropout,
-                )
-
-            starts = cu_seqlens[:-1]
-            ends = cu_seqlens[1:]
-            # cu_seqlens = [0, 10, 14, 27]
-            # starts: [0, 10, 14]
-            # ends: [10, 14, 17]
-            # starts_ends: [[0, 10], [10, 14], [14, 27]]
-            starts_ends = torch.cat([starts.unsqueeze(1), ends.unsqueeze(1)], dim=1)
-            attn_outputs = [
-                _iteration(start_end, query_states, key_states, value_states)
-                for start_end in starts_ends
-            ]
-            # attn_outputs = torch._higher_order_ops.while_loop(
-            # attn_outputs = torch.ops.higher_order.while_loop(
-            #    (lambda it, starts_ends, *_args: it < starts_ends.shape[0]),
-            #    _iteration,
-            #    (torch.tensor(0),
-            #       starts_ends, query_states, key_states, value_states), tuple(),
-            # )
-            attn_output = torch.cat(attn_outputs, dim=1)
+            attn_output, _ = attention_interface(
+                self,
+                query_states,
+                key_states,
+                value_states,
+                attention_mask=bool_mask,
+                scaling=self.scaling,
+                dropout=0.0 if not self.training else self.attention_dropout,
+                is_causal=False,
+                **kwargs,
+            )
         else:
             # Other implementations: Process each chunk separately
             lengths = cu_seqlens[1:] - cu_seqlens[:-1]
