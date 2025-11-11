@@ -44,11 +44,11 @@ def build_vision(args):
             opset_version=22,
         )
 
-    _testing.assert_onnx_program(vision_onnx_program)
-
     # apply ort_fusions
     vision_onnx_program.model, optimized_count = ort_fusions.optimize_for_ort(vision_onnx_program.model)
     print("ORT optimized fusion counts:", optimized_count)
+
+    _testing.assert_onnx_program(vision_onnx_program)
     
     # Restore original forward method
     model.get_image_features, model.forward = model.forward, model.get_image_features
