@@ -235,34 +235,57 @@ class Qwen2_5_VLVisionAttention(nn.Module):
                 **kwargs,
             )
         elif torch.compiler.is_exporting():
-            # make square mask
-            indices = torch.arange(
-                cu_seqlens.max(), dtype=cu_seqlens.dtype, device=cu_seqlens.device
+            # token_count is seq_length here
+            # Dynamically generate token offset based on cu_seqlens for ONNX export
+            batch_size = cu_seqlens.shape[0] - 1
+            max_seqlen_tensor = (cu_seqlens[1:] - cu_seqlens[:-1]).max()
+            # int32 is required for PackedMultiHeadAttention
+            cu_seqlens = cu_seqlens.to(torch.int32)
+            offsets_per_batch = torch.arange(
+                max_seqlen_tensor, dtype=torch.int32, device=hidden_states.device
             )
-            dot = (cu_seqlens.unsqueeze(1) <= indices.unsqueeze(0)).to(
-                cu_seqlens.dtype
+            batch_start_offsets = torch.arange(
+                batch_size, dtype=torch.int32, device=hidden_states.device
+            ) * max_seqlen_tensor
+            token_offset = offsets_per_batch.unsqueeze(0) + batch_start_offsets.unsqueeze(1)
+            
+            # Squeeze (Batch dim): (1, H, T, D) -> (H, T, D)
+            query_states_unpacked = query_states.squeeze(0)
+            key_states_unpacked = key_states.squeeze(0)
+            value_states_unpacked = value_states.squeeze(0)
+        
+            # Transpose: (H, T, D) -> (T, H, D)
+            query_states_unpacked = query_states_unpacked.transpose(0, 1)
+            key_states_unpacked = key_states_unpacked.transpose(0, 1)
+            value_states_unpacked = value_states_unpacked.transpose(0, 1)
+            
+            packed_qkv = torch.stack(
+                [query_states_unpacked, key_states_unpacked, value_states_unpacked], dim=2  # Insert 3 to dim=2
             )
-            dot = dot.sum(dim=0).to(query_states.dtype)
-            mask = dot.unsqueeze(1) @ dot.unsqueeze(0)
-            bool_mask = mask == dot**2
-            bool_mask = bool_mask.unsqueeze(0).unsqueeze(0)
-            if bool_mask.device != query_states.device:
-                bool_mask = bool_mask.to(query_states.device)
-
-            torch._check(bool_mask.shape[2] == key_states.shape[2])
-            torch._check(bool_mask.shape[3] == key_states.shape[2])
-
-            attn_output, _ = attention_interface(
-                self,
-                query_states,
-                key_states,
-                value_states,
-                attention_mask=bool_mask,
-                scaling=self.scaling,
-                dropout=0.0 if not self.training else self.attention_dropout,
-                is_causal=False,
-                **kwargs,
-            )
+            
+            attn_output = torch.onnx.ops.symbolic(
+                    "com.microsoft::PackedMultiHeadAttention",
+                    (
+                        packed_qkv,
+                        None,
+                        None,
+                        None,
+                        token_offset,
+                        cu_seqlens,
+                    ),
+                    dict(
+                        num_heads=self.num_heads,
+                        scale=self.scaling,
+                    ),
+                    dtype=query_states.dtype,
+                    shape=(
+                        seq_length,
+                        self.dim,
+                    ),
+                    version=1,
+                )
+            # ONNX symbolic outputs default to CPU; move to projection weight device to prevent mixed-device addmm during torch.export
+            attn_output = attn_output.to(self.proj.weight.device)
         else:
             # Other implementations: Process each chunk separately
             lengths = cu_seqlens[1:] - cu_seqlens[:-1]
