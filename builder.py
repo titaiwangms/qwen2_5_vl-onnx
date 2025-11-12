@@ -87,13 +87,15 @@ def build_vision(args):
     @onnxscript.script(opset=custom)
     def BatchedAttention(query_states, key_states, value_states, cu_seqlens, scale: float, num_heads: int):
         # Shapes of input Q/K/V: [B, num_heads, seq_len, head_dim]
-    
+
         # Convert Q/K/V to shape [B, seq_len, num_heads*head_dim]
         to_3d_shape = op.Constant(value_ints=[0, 0, -1])
-        query_3d = op.Reshape(op.Transpose(query_states, perm=[0, 2, 1, 3]), to_3d_shape)
+        query_transposed = op.Transpose(query_states, perm=[0, 2, 1, 3])
+        output_shape = op.Shape(query_transposed)
+        query_3d = op.Reshape(query_transposed, to_3d_shape)
         value_3d = op.Reshape(op.Transpose(value_states, perm=[0, 2, 1, 3]), to_3d_shape)
         key_3d = op.Reshape(op.Transpose(key_states, perm=[0, 2, 1, 3]), to_3d_shape)
-    
+        
         num_patches = op.Size(cu_seqlens) - 1
         seq_axis = op.Constant(value_ints=[1])
         attn_output = op.Slice(value_3d, [0], [0], seq_axis)  # Initialize empty output
@@ -102,18 +104,19 @@ def build_vision(args):
             i_plus_1_1d = i_1d + 1
             start = op.Gather(cu_seqlens, i_1d, axis=0)
             end = op.Gather(cu_seqlens, i_plus_1_1d, axis=0)
-    
+
             query_i = op.Slice(query_3d, start, end, seq_axis)
             key_i = op.Slice(key_3d, start, end, seq_axis)
             value_i = op.Slice(value_3d, start, end, seq_axis)
-    
+
             mha_output = msft_op.MultiHeadAttention(
                 query_i, key_i, value_i,
                 num_heads=num_heads,
                 scale=scale,
             )
             attn_output = op.Concat(attn_output, mha_output, axis=1)
-        return attn_output  # [B, seq_len, num_heads*head_dim]
+        attn_output_4d = op.Reshape(attn_output, output_shape)
+        return attn_output_4d  # [B, seq_len, num_heads, head_dim]
     
     # Update the functions into the model
     functions = [ir.from_proto(BatchedAttention.to_function_proto())]
@@ -131,7 +134,6 @@ def build_vision(args):
     # op-level verification
     # from torch.onnx._internal.exporter import _verification
     # v_info = _verification.verify_onnx_program(vision_onnx_program, kwargs=dummy_inputs)
-
 
     # TODO(titaiwang): We probably need to change output dimension name for image_features
     # to match embedding model input.
