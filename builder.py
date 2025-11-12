@@ -12,12 +12,12 @@ from torch.onnx._internal.exporter import _testing
 def build_vision(args):
     # NOTE: Shape: [total_patches_across_all_images, patch_volume]
     # This is to accomodate to video input where multiple images are passed in a batch.
-    pixel_values = torch.randn((14308, 1176), dtype=torch.float32)
+    pixel_values = torch.randn((1292, 1176), dtype=torch.float32)
     # Scale the values to the range [-1, 0.95] to fit actual values we observed in the example.
     pixel_values = pixel_values * (0.95 - (-1)) + (-1)
     pixel_values = pixel_values.to(args.precision).to(args.execution_provider.replace("dml", "cuda"))
 
-    grid_thw = torch.tensor([[1, 98, 146]], dtype=torch.int64).to(args.execution_provider.replace("dml", "cuda"))
+    grid_thw = torch.tensor([[1, 34, 38]], dtype=torch.int64).to(args.execution_provider.replace("dml", "cuda"))
 
     # Dynamo export
     dummy_inputs = {
@@ -25,40 +25,70 @@ def build_vision(args):
         "image_grid_thw": grid_thw
     }
     dynamic_shapes = {
-        "pixel_values": {0: "num_patches"},
+        "pixel_values": {0: "num_patches", 1: "hidden_height"},
         "image_grid_thw": {}
     }
 
     # NOTE: hack to image model export
-    model.forward, model.get_image_features = model.get_image_features, model.forward
+    # model.forward, model.get_image_features = model.get_image_features, model.forward
+    export_model = model.visual
 
+    print("-- export the model")
     with torch.no_grad():
-        vision_onnx_program = torch.onnx.export(
-            model,
-            kwargs=dummy_inputs,
-            input_names=["pixel_values", "image_grid_thw"],
-            output_names=["image_features"],
-            dynamic_shapes=dynamic_shapes,
-            dynamo=True,
-            optimize=True,
-            opset_version=22,
-        )
+        if args.patch in (1, "1", "true", "True", True):
+            dummy_inputs = {
+                "hidden_states": pixel_values,
+                "grid_thw": grid_thw
+            }
+            dynamic_shapes = {
+                "hidden_states": {0: "num_patches", 1: "hidden_height"},
+                "grid_thw": {}
+            }
+            print("-- export the model with patches")
+            from onnx_diagnostic.torch_export_patches import torch_export_patches
+            from onnx_diagnostic.export.api import to_onnx
+            with torch_export_patches(patch_transformers=True, patch_torch=False, patch_sympy=False):
+                vision_onnx_program = torch.onnx.export(
+                    export_model,
+                    kwargs=dummy_inputs,
+                    input_names=["pixel_values", "image_grid_thw"],
+                    output_names=["image_features"],
+                    dynamic_shapes=dynamic_shapes,
+                    dynamo=True,
+                    optimize=True,
+                    opset_version=22,
+                )
+        else:
+            print("-- export the model with no patch")
+            vision_onnx_program = torch.onnx.export(
+                export_model,
+                kwargs=dummy_inputs,
+                input_names=["pixel_values", "image_grid_thw"],
+                output_names=["image_features"],
+                dynamic_shapes=dynamic_shapes,
+                dynamo=True,
+                optimize=True,
+                opset_version=22,
+            )
 
     # apply ort_fusions
     vision_onnx_program.model, optimized_count = ort_fusions.optimize_for_ort(vision_onnx_program.model)
     print("ORT optimized fusion counts:", optimized_count)
 
-    _testing.assert_onnx_program(vision_onnx_program)
-    
-    # Restore original forward method
-    model.get_image_features, model.forward = model.forward, model.get_image_features
-
     # Save the ONNX model
-    filename = "qwen2_5_vl-vision.onnx"
+    print("-- save the model")
+    filename = f"qwen2_5_vl-vision-{args.precision}.onnx"
     vision_init_export = os.path.join(args.output, "vision_init_export")
     os.makedirs(vision_init_export, exist_ok=True)
     vision_path = os.path.join(vision_init_export, filename)
     vision_onnx_program.save(vision_path, external_data=True)
+
+    # discrepancies
+    print("-- checks for discrepancies")
+    _testing.assert_onnx_program(vision_onnx_program)
+    
+    # Restore original forward method
+    # model.get_image_features, model.forward = model.forward, model.get_image_features
 
     # ORT transformer optimizer
     vision_after_opt = os.path.join(args.output, "vision_after_opt")
@@ -225,6 +255,12 @@ def get_args():
         default="all",
         help="embedding, vision, or mrope",
     )
+    parser.add_argument(
+        "--patch",
+        required=False,
+        default="0",
+        help="use patches",
+    )
 
     args = parser.parse_args()
     mapping = {
@@ -243,12 +279,19 @@ if __name__ == "__main__":
         build_mrope(args)
     else:
         config = Qwen2_5_VLConfig.from_pretrained(args.input)
-        model = AutoModel.from_pretrained(args.input, attn_implementation="sdpa", trust_remote_code=True, torch_dtype=args.precision).to(args.execution_provider.replace("dml", "cuda"))
+        model = AutoModel.from_pretrained(
+            args.input,
+            attn_implementation="eager",
+            trust_remote_code=True,
+            torch_dtype=args.precision,
+            local_files_only=True,
+        ).to(args.execution_provider.replace("dml", "cuda"))
         
         # Build model components
         if args.part == "embedding":
             build_embedding(args)
         elif args.part == "vision":
+            # cp modeling_code/modeling_qwen2_5_vl.py ../transformers/src/transformers/models/qwen2_5_vl/
             # CUDA_VISIBLE_DEVICES=4,5,6 python builder.py -i Qwen/Qwen2.5-VL-7B-Instruct -o qwen_25_vl_bf16_vision -p bf16 -e cuda --part vision
             build_vision(args)
         else:
