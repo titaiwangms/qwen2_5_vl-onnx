@@ -19,7 +19,9 @@ def batched_attention2(query_states, key_states, value_states, cu_seqlens, scale
 
     # Convert Q/K/V to shape [B, seq_len, num_heads*head_dim]
     to_3d_shape = op.Constant(value_ints=[0, 0, -1])
-    query_3d = op.Reshape(op.Transpose(query_states, perm=[0, 2, 1, 3]), to_3d_shape)
+    query_transposed = op.Transpose(query_states, perm=[0, 2, 1, 3])
+    output_shape = op.Shape(query_transposed)
+    query_3d = op.Reshape(query_transposed, to_3d_shape)
     value_3d = op.Reshape(op.Transpose(value_states, perm=[0, 2, 1, 3]), to_3d_shape)
     key_3d = op.Reshape(op.Transpose(key_states, perm=[0, 2, 1, 3]), to_3d_shape)
     
@@ -42,11 +44,12 @@ def batched_attention2(query_states, key_states, value_states, cu_seqlens, scale
             scale=scale,
         )
         attn_output = op.Concat(attn_output, mha_output, axis=1)
-    return attn_output  # [B, seq_len, num_heads*head_dim]
+    attn_output_4d = op.Reshape(attn_output, output_shape)
+    return attn_output_4d  # [B, seq_len, num_heads, head_dim]
 
 qkv_type = onnxscript.FLOAT["B", num_heads, "seq_len", head_dim]
 cu_seqlens_type = onnxscript.INT64["num_patches + 1"]
-output_type = onnxscript.FLOAT["B", "seq_len", num_heads * head_dim]
+output_type = onnxscript.FLOAT["B", "seq_len", num_heads, head_dim]
 
 def make_model_proto():
     @onnxscript.script()
