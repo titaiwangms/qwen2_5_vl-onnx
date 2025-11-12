@@ -1,13 +1,35 @@
 import argparse
-import os
-import subprocess
-import sys
+import os 
 import torch
 
 from onnxscript.rewriter import ort_fusions
 from transformers import Qwen2_5_VLConfig, AutoModel
 from torch.onnx._internal.exporter import _testing
 
+import onnxscript
+import onnx_ir as ir
+from typing import Sequence
+import onnx_ir.passes.common as common_passes
+
+def _replace_functions(irmodel: ir.Model, irfunctions: Sequence[ir.Function]) -> ir.Model:
+    """A utility function to replace custom operations in a model with their expansions:
+    Args:
+        model: An ONNX ModelProto possibly containing calls to custom operations.
+        functions: A sequence of FunctionProto defining the expansions for the custom operations.
+
+    Returns:
+        An updated ModelProto with custom operations replaced by their expansions.
+    """
+    model_functions = irmodel.functions
+    if len(model_functions) != 0:
+        # Since we use inlining, check that there are no model-local functions.
+        raise ValueError("Input model cannot have model-local functions.")
+    for func in irfunctions:
+        model_functions[func.identifier()] = func
+    # TODO (rama): Ideally, we should provide users more control over renaming strategy for inlined values.
+    common_passes.InlinePass()(irmodel)
+    common_passes.RemoveUnusedOpsetsPass()(irmodel)
+    return irmodel
 
 def build_vision(args):
     # NOTE: Shape: [total_patches_across_all_images, patch_volume]
@@ -43,12 +65,10 @@ def build_vision(args):
             optimize=True,
             opset_version=22,
         )
-
+    
     # apply ort_fusions
     vision_onnx_program.model, optimized_count = ort_fusions.optimize_for_ort(vision_onnx_program.model)
     print("ORT optimized fusion counts:", optimized_count)
-
-    _testing.assert_onnx_program(vision_onnx_program)
     
     # Restore original forward method
     model.get_image_features, model.forward = model.forward, model.get_image_features
@@ -60,36 +80,58 @@ def build_vision(args):
     vision_path = os.path.join(vision_init_export, filename)
     vision_onnx_program.save(vision_path, external_data=True)
 
-    # ORT transformer optimizer
-    vision_after_opt = os.path.join(args.output, "vision_after_opt")
-    vision_opt_path = os.path.join(vision_after_opt, filename)
-    subprocess.run(
-        [
-            f"{sys.executable}", "-m", "onnxruntime.transformers.optimizer",
-            "--input", vision_path,
-            "--output", vision_opt_path,
-            "--model_type", "clip",
-            "--num_heads", str(16),
-            "--hidden_size", str(1280),
-            "--use_external_data_format",
-            "--opt_level", str(0),
-            "--disable_shape_inference",
-        ]
-    )
-    # shutil.rmtree(vision_init_export)
+    # graph surguery to change custom attention operator to onnxscript function
+    custom = onnxscript.values.Opset("custom", 1)
+    op = onnxscript.opset22
+    msft_op = onnxscript.values.Opset("com.microsoft", 1)
+    @onnxscript.script(opset=custom)
+    def BatchedAttention(query_states, key_states, value_states, cu_seqlens, scale: float, num_heads: int):
+        # Shapes of input Q/K/V: [B, num_heads, seq_len, head_dim]
+    
+        # Convert Q/K/V to shape [B, seq_len, num_heads*head_dim]
+        to_3d_shape = op.Constant(value_ints=[0, 0, -1])
+        query_3d = op.Reshape(op.Transpose(query_states, perm=[0, 2, 1, 3]), to_3d_shape)
+        value_3d = op.Reshape(op.Transpose(value_states, perm=[0, 2, 1, 3]), to_3d_shape)
+        key_3d = op.Reshape(op.Transpose(key_states, perm=[0, 2, 1, 3]), to_3d_shape)
+    
+        num_patches = op.Size(cu_seqlens) - 1
+        seq_axis = op.Constant(value_ints=[1])
+        attn_output = op.Slice(value_3d, [0], [0], seq_axis)  # Initialize empty output
+        for i in range(num_patches):
+            i_1d = op.Reshape(i, [1])
+            i_plus_1_1d = i_1d + 1
+            start = op.Gather(cu_seqlens, i_1d, axis=0)
+            end = op.Gather(cu_seqlens, i_plus_1_1d, axis=0)
+    
+            query_i = op.Slice(query_3d, start, end, seq_axis)
+            key_i = op.Slice(key_3d, start, end, seq_axis)
+            value_i = op.Slice(value_3d, start, end, seq_axis)
+    
+            mha_output = msft_op.MultiHeadAttention(
+                query_i, key_i, value_i,
+                num_heads=num_heads,
+                scale=scale,
+            )
+            attn_output = op.Concat(attn_output, mha_output, axis=1)
+        return attn_output  # [B, seq_len, num_heads*head_dim]
+    
+    # Update the functions into the model
+    functions = [ir.from_proto(BatchedAttention.to_function_proto())]
+    vision_onnx_program.model = _replace_functions(vision_onnx_program.model, functions)
 
-    # ORT 4-bits quantizer
-    vision_final_path = os.path.join(args.output, filename)
-    cmd = [
-        f"{sys.executable}", "-m", "onnxruntime.quantization.matmul_nbits_quantizer",
-        "--input_model", vision_opt_path,
-        "--output_model", vision_final_path,
-        "--block_size", str(32),
-    ]
-    if args.precision == torch.float32:
-        cmd.extend(["--accuracy_level", str(4)])
-    subprocess.run(cmd)
-    # shutil.rmtree(vision_after_opt)
+    # Save the ONNX model
+    filename = "qwen2_5_vl-vision.onnx"
+    vision_init_export = os.path.join(args.output, "vision_loop_export")
+    os.makedirs(vision_init_export, exist_ok=True)
+    vision_path = os.path.join(vision_init_export, filename)
+    vision_onnx_program.save(vision_path, external_data=True)
+
+    _testing.assert_onnx_program(vision_onnx_program)
+    
+    # op-level verification
+    # from torch.onnx._internal.exporter import _verification
+    # v_info = _verification.verify_onnx_program(vision_onnx_program, kwargs=dummy_inputs)
+
 
     # TODO(titaiwang): We probably need to change output dimension name for image_features
     # to match embedding model input.
@@ -137,9 +179,9 @@ def build_embedding(args):
             dynamic_shapes=dynamic_shapes,
             dynamo=True,
             optimize=True,
-            opset_version=22,
+            opset_version=23,
         )
-
+    # Test the parity of the exported model
     _testing.assert_onnx_program(embedding_onnx_program)
 
     # Restore original forward method
@@ -150,34 +192,6 @@ def build_embedding(args):
     filename = "qwen2_5_vl-embedding.onnx"
     fpath_1 = os.path.join(args.output, filename)
     embedding_onnx_program.save(fpath_1, external_data=True)
-
-def build_mrope(args):
-        import transformers
-        apply_multimodal_rotary_pos_emb = (
-            transformers.models.qwen2_5_vl.modeling_qwen2_5_vl.apply_multimodal_rotary_pos_emb
-        )
-
-        class Model(torch.nn.Module):
-            def forward(self, q, k, cos, sin):
-                return apply_multimodal_rotary_pos_emb(q, k, cos, sin, [16, 24, 24])
-        dtype = args.precision
-        inputs = (
-            torch.rand((1, 28, 3606, 128), dtype=dtype),  # q
-            torch.rand((1, 4, 3606, 128), dtype=dtype),  # k
-            torch.rand((3, 1, 3606, 128), dtype=dtype),  # cos
-            torch.rand((3, 1, 3606, 128), dtype=dtype),  # sin
-        )
-        model = Model()
-        ds = (
-            {0: "batch_size", 2: "seq_length"},  # q
-            {0: "batch_size", 2: "seq_length"},  # k
-            {1: "batch_size", 2: "seq_length"},  # cos
-            {1: "batch_size", 2: "seq_length"},  # sin
-        )
-        epo = torch.onnx.export(model, inputs, dynamic_shapes=ds)
-        _testing.assert_onnx_program(epo)
-        epo.save("mrope.onnx")
-
 
 def get_args():
     parser = argparse.ArgumentParser()
@@ -223,7 +237,7 @@ def get_args():
         "--part",
         required=False,
         default="all",
-        help="embedding, vision, or mrope",
+        help="embedding, vision",
     )
 
     args = parser.parse_args()
@@ -239,17 +253,15 @@ def get_args():
 if __name__ == "__main__":
     args = get_args()
     
-    if args.part == "mrope":
-        build_mrope(args)
+
+    config = Qwen2_5_VLConfig.from_pretrained(args.input)
+    model = AutoModel.from_pretrained(args.input, attn_implementation="sdpa", trust_remote_code=True, torch_dtype=args.precision).to(args.execution_provider.replace("dml", "cuda"))
+    
+    # Build model components
+    if args.part == "embedding":
+        build_embedding(args)
+    elif args.part == "vision":
+        build_vision(args)
     else:
-        config = Qwen2_5_VLConfig.from_pretrained(args.input)
-        model = AutoModel.from_pretrained(args.input, attn_implementation="sdpa", trust_remote_code=True, torch_dtype=args.precision).to(args.execution_provider.replace("dml", "cuda"))
-        
-        # Build model components
-        if args.part == "embedding":
-            build_embedding(args)
-        elif args.part == "vision":
-            build_vision(args)
-        else:
-            build_embedding(args)
-            build_vision(args)
+        build_embedding(args)
+        build_vision(args)

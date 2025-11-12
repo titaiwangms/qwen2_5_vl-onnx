@@ -208,119 +208,61 @@ class Qwen2_5_VLVisionAttention(nn.Module):
         cos, sin = position_embeddings
         query_states, key_states = apply_rotary_pos_emb_vision(query_states, key_states, cos, sin)
 
+        query_states = query_states.transpose(0, 1).unsqueeze(0)
+        key_states = key_states.transpose(0, 1).unsqueeze(0)
+        value_states = value_states.transpose(0, 1).unsqueeze(0)
+
+        cu_seqlens = cu_seqlens.to(dtype=torch.int64)
+
         attention_interface: Callable = eager_attention_forward
         if self.config._attn_implementation != "eager":
             attention_interface = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
 
-        # if self.config._attn_implementation == "flash_attention_2":
-        #     # Flash Attention 2: Use cu_seqlens for variable length attention
-        #     max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max()
-        #     attn_output, _ = attention_interface(
-        #         self,
-        #         query_states,
-        #         key_states,
-        #         value_states,
-        #         attention_mask=None,
-        #         scaling=self.scaling,
-        #         dropout=0.0 if not self.training else self.attention_dropout,
-        #         cu_seq_lens_q=cu_seqlens,
-        #         cu_seq_lens_k=cu_seqlens,
-        #         max_length_q=max_seqlen,
-        #         max_length_k=max_seqlen,
-        #         is_causal=False,
-        #         **kwargs,
-        #     )
-        if torch.compiler.is_exporting():
-            # token_count is seq_length here
-            # Dynamically generate token offset based on cu_seqlens for ONNX export
-            
-            def _generate_packed_to_padded_mapping_2d(cu_seqlens):
-                """
-                Generate a tensor that maps packed sequence positions to their logical positions
-                in a padded 2D tensor using 2D matrix approach with boolean masking.
-            
-                Args:
-                    cu_seqlens: Cumulative sequence lengths tensor, e.g., [0, 1, 3, 7]
-                
-                Returns:
-                    mapping_tensor: Tensor containing the mapping from packed to padded positions
-            
-                Example:
-                    cu_seqlens = [0, 1, 3, 7]  # lengths: [1, 2, 4]
-                    Returns: [0, 4, 5, 8, 9, 10, 11, 1, 2, 3, 6, 7]
-                """
-                device = cu_seqlens.device
-                dtype = cu_seqlens.dtype
-            
-                # Get sequence lengths
-                lengths = cu_seqlens[1:] - cu_seqlens[:-1]
-                num_sequences = lengths.shape[0]
-                max_length = lengths.max()
-            
-                # Generate the entire 2D matrix of position indices
-                # Shape: [num_sequences, max_length]
-                # Example: [[0, 1, 2, 3], [4, 5, 6, 7], [8, 9, 10, 11]]
-                row_indices = torch.arange(num_sequences, device=device, dtype=dtype).unsqueeze(1)
-                col_indices = torch.arange(max_length, device=device, dtype=dtype).unsqueeze(0)
-                position_matrix = row_indices * max_length + col_indices
-            
-                # Create boolean mask for unpadded positions
-                # Shape: [num_sequences, max_length]
-                # True where position is unpadded, False where padded
-                unpadded_mask = col_indices < lengths.unsqueeze(1)
-            
-                # Extract unpadded positions (flatten and select)
-                unpadded_positions = position_matrix[unpadded_mask]
-            
-                # Extract padded positions (flatten and select complement)
-                padded_positions = position_matrix[~unpadded_mask]
-            
-                # Concatenate: unpadded positions first, then padded positions
-                mapping_tensor = torch.cat([unpadded_positions, padded_positions])
-
-                batch_size = cu_seqlens.shape[0] - 1
-                mapping_tensor = mapping_tensor.reshape(batch_size, -1)
-
-                return mapping_tensor
-            
-            # int32 is required for PackedMultiHeadAttention
-            cu_seqlens = cu_seqlens.to(device=hidden_states.device, dtype=torch.int32)
-            token_offset = _generate_packed_to_padded_mapping_2d(cu_seqlens)
-            
-            packed_qkv = torch.stack(
-                [query_states, key_states, value_states], dim=2  # Insert 3 to dim=2
+        if self.config._attn_implementation == "flash_attention_2":
+            # Flash Attention 2: Use cu_seqlens for variable length attention
+            max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max()
+            attn_output, _ = attention_interface(
+                self,
+                query_states,
+                key_states,
+                value_states,
+                attention_mask=None,
+                scaling=self.scaling,
+                dropout=0.0 if not self.training else self.attention_dropout,
+                cu_seq_lens_q=cu_seqlens,
+                cu_seq_lens_k=cu_seqlens,
+                max_length_q=max_seqlen,
+                max_length_k=max_seqlen,
+                is_causal=False,
+                **kwargs,
             )
-
+        elif torch.compiler.is_exporting():
+            # Specifically, window attention and global attention mechanism needs to be manually
+            # broke down into QKV, so GQA would not need to take cu_seqlens.
             attn_output = torch.onnx.ops.symbolic(
-                    "com.microsoft::PackedMultiHeadAttention",
+                    "custom::BatchedAttention",
                     (
-                        packed_qkv,
-                        None,
-                        None,
-                        None,
-                        token_offset,
+                        query_states,
+                        key_states,
+                        value_states,
                         cu_seqlens,
                     ),
                     dict(
+                        scale= self.scaling,
                         num_heads=self.num_heads,
-                        scale=self.scaling,
                     ),
                     dtype=query_states.dtype,
                     shape=(
-                        seq_length,
-                        self.dim,
+                        query_states.shape[0],  # batch_size
+                        query_states.shape[2],  # sequence_length (total patches)
+                        query_states.shape[1],  # num_heads
+                        query_states.shape[3],  # head_size
                     ),
                     version=1,
                 )
             # ONNX symbolic outputs default to CPU; move to projection weight device to prevent mixed-device addmm during torch.export
             attn_output = attn_output.to(self.proj.weight.device)
         else:
-            
-            # [batch, num_heads, seq_length, head_dim]
-            query_states = query_states.transpose(0, 1).unsqueeze(0)
-            key_states = key_states.transpose(0, 1).unsqueeze(0)
-            value_states = value_states.transpose(0, 1).unsqueeze(0)
-            
             # Other implementations: Process each chunk separately
             lengths = cu_seqlens[1:] - cu_seqlens[:-1]
             splits = [
