@@ -26,7 +26,7 @@ def build_vision(args):
     }
     dynamic_shapes = {
         "pixel_values": {0: "num_patches"},
-        "image_grid_thw": None
+        "image_grid_thw": {}
     }
 
     # NOTE: hack to image model export

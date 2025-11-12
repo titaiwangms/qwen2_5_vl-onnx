@@ -243,8 +243,8 @@ class Qwen2_5_VLVisionAttention(nn.Module):
                 cu_seqlens.dtype
             )
             dot = dot.sum(dim=0).to(query_states.dtype)
-            mask = dot.unsqueeze(1) @ dot.unsqueeze(0)
-            bool_mask = mask == dot**2
+            mask = dot.unsqueeze(1) - dot.unsqueeze(0)
+            bool_mask = mask == 0
             bool_mask = bool_mask.unsqueeze(0).unsqueeze(0)
             if bool_mask.device != query_states.device:
                 bool_mask = bool_mask.to(query_states.device)
