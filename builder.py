@@ -249,6 +249,7 @@ if __name__ == "__main__":
         if args.part == "embedding":
             build_embedding(args)
         elif args.part == "vision":
+            # CUDA_VISIBLE_DEVICES=4,5,6 python builder.py -i Qwen/Qwen2.5-VL-7B-Instruct -o qwen_25_vl_bf16_vision -p bf16 -e cuda --part vision
             build_vision(args)
         else:
             build_embedding(args)
