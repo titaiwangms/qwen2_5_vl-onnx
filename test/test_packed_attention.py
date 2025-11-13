@@ -6,11 +6,13 @@ import onnxruntime as ort
 import torch
 from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
 
-choice = 1  # Change to 1 to test FLOAT16
+
+dtype_ep_choice = 1  # 0 or 1 to test as below
+
 onnx_dtype, np_dtype, EP = [
     (onnxscript.FLOAT, np.float32, ["CPUExecutionProvider"]),
     (onnxscript.FLOAT16, np.float16, ["CUDAExecutionProvider", "CPUExecutionProvider"]),
-][choice]
+][dtype_ep_choice]
 
 op = onnxscript.opset22
 msft_op = onnxscript.values.Opset("com.microsoft", 1)
@@ -109,14 +111,24 @@ qkv_type = onnx_dtype["B", num_heads, "seq_len", head_dim]
 cu_seqlens_type = onnxscript.INT32["num_patches + 1"]
 output_type = onnx_dtype["B", "seq_len", num_heads, head_dim]
 
-def make_model_proto():
+def make_loop_model_proto():
     @onnxscript.script()
     def packed_attention_model(query: qkv_type, key: qkv_type, value: qkv_type, cu_seqlens: cu_seqlens_type) -> output_type:
         return loop_attention(query, key, value, cu_seqlens, scale=0.125, num_heads=num_heads)
     proto = packed_attention_model.to_model_proto()
-    print(onnx.printer.to_text(proto))
+    # print(onnx.printer.to_text(proto))
     proto = onnx.inliner.inline_local_functions(proto)
-    print(onnx.printer.to_text(proto))
+    # print(onnx.printer.to_text(proto))
+    return proto
+
+def make_packed_mha_model_proto():
+    @onnxscript.script()
+    def packed_attention_model(query: qkv_type, key: qkv_type, value: qkv_type, cu_seqlens: cu_seqlens_type) -> output_type:
+        return packed_attention(query, key, value, cu_seqlens, scale=0.125, num_heads=num_heads)
+    proto = packed_attention_model.to_model_proto()
+    # print(onnx.printer.to_text(proto))
+    proto = onnx.inliner.inline_local_functions(proto)
+    # print(onnx.printer.to_text(proto))
     return proto
 
 def generate_test_inputs():
@@ -220,13 +232,13 @@ def run_pytorch_model(inputs, scale=0.125):
     
     return output_np
 
-def compare_outputs(onnx_output, pytorch_output, rtol=1e-3, atol=1e-5):
+def compare_outputs(onnx_output, pytorch_output, mesg: str, rtol=1e-3, atol=1e-5):
     """Compare ONNX Runtime and PyTorch outputs."""
     print("\n" + "="*60)
     print("Comparing outputs...")
     print("="*60)
     
-    print(f"ONNX output shape: {onnx_output.shape}")
+    print(f"ONNX {mesg} output shape: {onnx_output.shape}")
     print(f"PyTorch output shape: {pytorch_output.shape}")
     
     # Check if shapes match
@@ -265,17 +277,23 @@ def compare_outputs(onnx_output, pytorch_output, rtol=1e-3, atol=1e-5):
 
 
 if __name__ == "__main__":
-    model_proto = make_model_proto()
-    
+  
     # Generate test inputs
     inputs = generate_test_inputs()
     
-    # Run the model with ONNX Runtime
+    # Run the loop-based model with ONNX Runtime
+    model_proto = make_loop_model_proto()
     onnx_outputs = run_onnx_model(model_proto, inputs)
     
     # Run the model with PyTorch
     pytorch_output = run_pytorch_model(inputs, scale=0.125)
     
     # Compare outputs
-    compare_outputs(onnx_outputs[0], pytorch_output)
+    compare_outputs(onnx_outputs[0], pytorch_output, "Loop-based Attention")
+
+    # Run the packed_mha-based model with ONNX Runtime
+    model_proto = make_packed_mha_model_proto()
+    onnx_outputs = run_onnx_model(model_proto, inputs)
+    # Compare outputs
+    compare_outputs(onnx_outputs[0], pytorch_output, "Packed MHA Attention")
 
