@@ -1,5 +1,6 @@
 import os
 import time
+import sys
 import onnxscript
 import onnx
 import onnx.inliner
@@ -190,7 +191,7 @@ def generate_test_inputs(patch_size_min, patch_size_max, num_patches, num_heads,
         "cu_seqlens": cu_seqlens
     }
 
-def run_onnx_model(model_proto, inputs, EP, exp_name):
+def run_onnx_model(model_proto, inputs, EP, exp_name, debug=False):
     """Create ONNX Runtime session and run inference."""
     # Save model to a temporary location
     dtype = inputs["query"].dtype
@@ -203,6 +204,9 @@ def run_onnx_model(model_proto, inputs, EP, exp_name):
     session_options.optimized_model_filepath = f"{model_path}.opt.onnx"
     session_options.enable_profiling = True
     session_options.profile_file_prefix = f"{model_path}.profiling"
+    if debug:
+        session_options.log_severity_level = 0
+        session_options.log_verbosity_level = 0
     session = ort.InferenceSession(model_path, session_options, providers=EP)
     
     # Run inference
@@ -336,7 +340,8 @@ def compare_outputs(onnx_output, pytorch_output, mesg: str, rtol=1, atol=2e-3, e
 
 
 if __name__ == "__main__":
-
+    debug = "debug" in sys.argv
+    only_bfloat16 = "bfloat16" in sys.argv
     choices = [
         (ml_dtypes.bfloat16, ["CUDAExecutionProvider"]),
         (ml_dtypes.bfloat16, ["CPUExecutionProvider"]),
@@ -348,6 +353,8 @@ if __name__ == "__main__":
     data = []
 
     for l_np_dtype, l_EP in choices:
+        if only_bfloat16 and l_np_dtype != ml_dtypes.bfloat16:
+            continue
         l_num_patches = 40
         l_patch_size_min = 20
         l_patch_size_max = 40
@@ -367,6 +374,8 @@ if __name__ == "__main__":
         except ort.capi.onnxruntime_pybind11_state.NotImplemented as e:
             data.append(dict(name="Loop MHA", dtype=pytorch_output.dtype, ep=l_EP[0], ERR="NotImplemented", ERRMSG=str(e)))
             ok = False
+            if debug:
+                raise
         if ok:  
             obs = compare_outputs(onnx_outputs[0], pytorch_output, "Loop MHA", ep=l_EP[0])
             obs["duration"] = duration
@@ -375,17 +384,21 @@ if __name__ == "__main__":
         # Run the packed_mha-based model with ONNX Runtime
         model_proto = make_packed_mha_model_proto(l_np_dtype, l_scale, num_heads)
         try:
-            onnx_outputs, duration = run_onnx_model(model_proto, inputs, l_EP, "packedMHA")
+            onnx_outputs, duration = run_onnx_model(model_proto, inputs, l_EP, "packedMHA", debug=debug)
             ok = True
         except ort.capi.onnxruntime_pybind11_state.NotImplemented as e:
             data.append(dict(name="Packed MHA", dtype=pytorch_output.dtype, ep=l_EP[0], ERR="NotImplemented", ERRMSG=str(e)))
             ok = False
+            if debug:
+                raise
         except ort.capi.onnxruntime_pybind11_state.InvalidGraph as e:
             data.append(dict(name="Packed MHA", dtype=pytorch_output.dtype, ep=l_EP[0], ERR="InvalidGraph", ERRMSG=str(e)))
             print("-------")
             print(e)
             print("-------")
             ok = False
+            if debug:
+                raise
         if ok:
             obs = compare_outputs(onnx_outputs[0], pytorch_output, "Packed MHA Attention", ep=l_EP[0])
             obs["duration"] = duration
