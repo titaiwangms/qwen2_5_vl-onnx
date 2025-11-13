@@ -6,25 +6,15 @@ import onnxruntime as ort
 import torch
 from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
 
-
-dtype_ep_choice = 1  # 0 or 1 to test as below
-
-onnx_dtype, np_dtype, EP = [
-    (onnxscript.FLOAT, np.float32, ["CPUExecutionProvider"]),
-    (onnxscript.FLOAT16, np.float16, ["CUDAExecutionProvider", "CPUExecutionProvider"]),
-][dtype_ep_choice]
-
 op = onnxscript.opset22
 msft_op = onnxscript.values.Opset("com.microsoft", 1)
 
 num_heads = 2
 head_dim = 256
-num_patches = 40
-patch_size_min = 20
-patch_size_max = 40
+num_patches = 4
 
 @onnxscript.script()
-def loop_attention(query_states, key_states, value_states, cu_seqlens, scale: float, num_heads: int):
+def batched_attention2(query_states, key_states, value_states, cu_seqlens, scale: float, num_heads: int):
     # Shapes of input Q/K/V: [B, num_heads, seq_len, head_dim]
 
     # Convert Q/K/V to shape [B, seq_len, num_heads*head_dim]
@@ -37,7 +27,6 @@ def loop_attention(query_states, key_states, value_states, cu_seqlens, scale: fl
     
     num_patches = op.Size(cu_seqlens) - 1
     seq_axis = op.Constant(value_ints=[1])
-    seq_axis_int32 = op.Cast(seq_axis, to=6)
     attn_output = op.Slice(value_3d, [0], [0], seq_axis)  # Initialize empty output
     for i in range(num_patches):
         i_1d = op.Reshape(i, [1])
@@ -45,9 +34,9 @@ def loop_attention(query_states, key_states, value_states, cu_seqlens, scale: fl
         start = op.Gather(cu_seqlens, i_1d, axis=0)
         end = op.Gather(cu_seqlens, i_plus_1_1d, axis=0)
 
-        query_i = op.Slice(query_3d, start, end, seq_axis_int32)
-        key_i = op.Slice(key_3d, start, end, seq_axis_int32)
-        value_i = op.Slice(value_3d, start, end, seq_axis_int32)
+        query_i = op.Slice(query_3d, start, end, seq_axis)
+        key_i = op.Slice(key_3d, start, end, seq_axis)
+        value_i = op.Slice(value_3d, start, end, seq_axis)
 
         mha_output = msft_op.MultiHeadAttention(
             query_i, key_i, value_i,
@@ -58,77 +47,18 @@ def loop_attention(query_states, key_states, value_states, cu_seqlens, scale: fl
     attn_output_4d = op.Reshape(attn_output, output_shape)
     return attn_output_4d  # [B, seq_len, num_heads, head_dim]
 
-@onnxscript.script()
-def packed_attention(query, key, value, cu_seqlens, scale: float, num_heads: int):
-    # Shapes of input Q/K/V: [B=1, num_heads, seq_len, head_dim]
-    num_patches = op.Cast(op.Size(cu_seqlens), to=6) - 1
-    # Identify lengths of each patch and max length
-    starts = op.Slice(cu_seqlens, [0], [-1], [0])  # [num_patches]
-    ends = op.Slice(cu_seqlens, [1], [9223372036854775807], [0])  # [num_patches]
-    lengths = ends - starts  # [num_patches]
-    max_length = op.ReduceMax(lengths, [0], keepdims=0)  # [1]
-    # Create token_offset required by the PackedMultiHeadAttention op
-    # First create matrix: [
-    #    [0, 1, 2, ..., max_length-1],
-    #    [max_length, max_length+1, ..., 2*max_length-1],
-    #    ... ]
-    # zero_int64 = op.Constant(value_int=0)
-    # zero_int32 = op.Cast(zero_int64, to=6)
-    # one_int64 = op.Constant(value_int=0)
-    # one_int32 = op.Cast(one_int64, to=6)
-    rows = op.Range(0, num_patches, 1)  # [num_patches]
-    rows_2d = op.Unsqueeze(rows, [1])  # [num_patches, 1]
-    cols = op.Range(0, max_length, 1)  # [max_length]
-    cols_2d = op.Unsqueeze(cols, [0])  # [1, max_length]
-    position_matrix = rows_2d * max_length + cols_2d  # [num_patches, max_length]
-    position_matrix_shape = op.Shape(position_matrix)
-    # Now find positions of valid tokens and padding tokens
-    # Position at column j in row i is valid if j < lengths[i]
-    token_mask = cols_2d < op.Unsqueeze(lengths, [1])  # [num_patches, max_length]  
-    token_mask_1d = op.Reshape(token_mask, [-1])  # [num_patches * max_length]
-    # All other positions are padding
-    padded_mask_1d = op.Not(token_mask_1d)
-    valid_token_positions = op.Compress(position_matrix, token_mask)  # [total_valid_tokens]
-    padded_token_positions = op.Compress(position_matrix, padded_mask_1d)  # [total_padded_tokens]
-    token_offset_1d = op.Concat(valid_token_positions, padded_token_positions, axis=0)  # [num_patches * max_length]
-    token_offset = op.Reshape(token_offset_1d, position_matrix_shape)  # [num_patches, max_length]
+qkv_type = onnxscript.FLOAT["B", num_heads, "seq_len", head_dim]
+cu_seqlens_type = onnxscript.INT64["num_patches + 1"]
+output_type = onnxscript.FLOAT["B", "seq_len", num_heads, head_dim]
 
-    # Convert query/key/value to shape (seq_len, num_heads* head_dim)
-    # squeeze(0) => transpose(0,1) => reshape([0, -1])
-    query_3d = op.Transpose(op.Squeeze(query, [0]), perm=[1,0,2])
-    shape_3d = op.Shape(query_3d)
-    query_2d = op.Reshape(query_3d, [0, -1])
-    key_2d = op.Reshape(op.Transpose(op.Squeeze(key, [0]), perm=[1,0,2]), [0, -1])
-    value_2d = op.Reshape(op.Transpose(op.Squeeze(value, [0]), perm=[1,0,2]), [0, -1])
-
-    packed_attn_output_2d = msft_op.PackedMultiHeadAttention(
-        query_2d, key_2d, value_2d, None, token_offset, cu_seqlens, scale=scale, num_heads=num_heads
-    )
-    packed_attn_output_3d = op.Reshape(packed_attn_output_2d, shape_3d)
-    return op.Unsqueeze(packed_attn_output_3d, [0])  # [B, seq_len, num_heads, head_dim]
-
-qkv_type = onnx_dtype["B", num_heads, "seq_len", head_dim]
-cu_seqlens_type = onnxscript.INT32["num_patches + 1"]
-output_type = onnx_dtype["B", "seq_len", num_heads, head_dim]
-
-def make_loop_model_proto():
+def make_model_proto():
     @onnxscript.script()
     def packed_attention_model(query: qkv_type, key: qkv_type, value: qkv_type, cu_seqlens: cu_seqlens_type) -> output_type:
-        return loop_attention(query, key, value, cu_seqlens, scale=0.125, num_heads=num_heads)
+        return batched_attention2(query, key, value, cu_seqlens, scale=0.125, num_heads=num_heads)
     proto = packed_attention_model.to_model_proto()
-    # print(onnx.printer.to_text(proto))
+    print(onnx.printer.to_text(proto))
     proto = onnx.inliner.inline_local_functions(proto)
-    # print(onnx.printer.to_text(proto))
-    return proto
-
-def make_packed_mha_model_proto():
-    @onnxscript.script()
-    def packed_attention_model(query: qkv_type, key: qkv_type, value: qkv_type, cu_seqlens: cu_seqlens_type) -> output_type:
-        return packed_attention(query, key, value, cu_seqlens, scale=0.125, num_heads=num_heads)
-    proto = packed_attention_model.to_model_proto()
-    # print(onnx.printer.to_text(proto))
-    proto = onnx.inliner.inline_local_functions(proto)
-    # print(onnx.printer.to_text(proto))
+    print(onnx.printer.to_text(proto))
     return proto
 
 def generate_test_inputs():
@@ -136,17 +66,17 @@ def generate_test_inputs():
     batch_size = 1
     
     # Generate random patch lengths and calculate total sequence length
-    patch_lengths = np.random.randint(patch_size_min, patch_size_max, size=num_patches, dtype=np.int64)
+    patch_lengths = np.random.randint(5, 15, size=num_patches, dtype=np.int64)
     seq_len = patch_lengths.sum()
     
     # Generate cumulative sequence lengths: [num_patches + 1]
-    cu_seqlens = np.zeros(num_patches + 1, dtype=np.int32)
+    cu_seqlens = np.zeros(num_patches + 1, dtype=np.int64)
     cu_seqlens[1:] = np.cumsum(patch_lengths)
     
     # Generate Q, K, V tensors: [B, num_heads, seq_len, head_dim]
-    query = np.random.randn(batch_size, num_heads, seq_len, head_dim).astype(np_dtype)
-    key = np.random.randn(batch_size, num_heads, seq_len, head_dim).astype(np_dtype)
-    value = np.random.randn(batch_size, num_heads, seq_len, head_dim).astype(np_dtype)
+    query = np.random.randn(batch_size, num_heads, seq_len, head_dim).astype(np.float32)
+    key = np.random.randn(batch_size, num_heads, seq_len, head_dim).astype(np.float32)
+    value = np.random.randn(batch_size, num_heads, seq_len, head_dim).astype(np.float32)
     
     print(f"Generated inputs:")
     print(f"  query shape: {query.shape}")
@@ -170,7 +100,8 @@ def run_onnx_model(model_proto, inputs):
     
     # Create ONNX Runtime session
     session_options = ort.SessionOptions()
-    session = ort.InferenceSession(model_path, session_options, providers=EP)
+    providers = ['CPUExecutionProvider']
+    session = ort.InferenceSession(model_path, session_options, providers=providers)
     
     # Run inference
     print("\nRunning inference...")
@@ -232,13 +163,13 @@ def run_pytorch_model(inputs, scale=0.125):
     
     return output_np
 
-def compare_outputs(onnx_output, pytorch_output, mesg: str, rtol=1e-3, atol=1e-5):
+def compare_outputs(onnx_output, pytorch_output, rtol=1e-3, atol=1e-5):
     """Compare ONNX Runtime and PyTorch outputs."""
     print("\n" + "="*60)
     print("Comparing outputs...")
     print("="*60)
     
-    print(f"ONNX {mesg} output shape: {onnx_output.shape}")
+    print(f"ONNX output shape: {onnx_output.shape}")
     print(f"PyTorch output shape: {pytorch_output.shape}")
     
     # Check if shapes match
@@ -277,23 +208,17 @@ def compare_outputs(onnx_output, pytorch_output, mesg: str, rtol=1e-3, atol=1e-5
 
 
 if __name__ == "__main__":
-  
+    model_proto = make_model_proto()
+    
     # Generate test inputs
     inputs = generate_test_inputs()
     
-    # Run the loop-based model with ONNX Runtime
-    model_proto = make_loop_model_proto()
+    # Run the model with ONNX Runtime
     onnx_outputs = run_onnx_model(model_proto, inputs)
     
     # Run the model with PyTorch
     pytorch_output = run_pytorch_model(inputs, scale=0.125)
     
     # Compare outputs
-    compare_outputs(onnx_outputs[0], pytorch_output, "Loop-based Attention")
-
-    # Run the packed_mha-based model with ONNX Runtime
-    model_proto = make_packed_mha_model_proto()
-    onnx_outputs = run_onnx_model(model_proto, inputs)
-    # Compare outputs
-    compare_outputs(onnx_outputs[0], pytorch_output, "Packed MHA Attention")
+    compare_outputs(onnx_outputs[0], pytorch_output)
 
