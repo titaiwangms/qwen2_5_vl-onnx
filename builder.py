@@ -1,6 +1,7 @@
 import argparse
 import os 
 import torch
+import shutil
 
 from onnxscript.rewriter import ort_fusions
 from transformers import Qwen2_5_VLConfig, AutoModel
@@ -122,21 +123,17 @@ def build_vision(args):
     functions = [ir.from_proto(BatchedAttention.to_function_proto())]
     vision_onnx_program.model = _replace_functions(vision_onnx_program.model, functions)
 
+    # NOTE: We need to rename output shape name to match the original name
+    vision_onnx_program.model.graph.outputs[0].shape[0] = "num_logical_patches"
+
     # Save the ONNX model
     filename = "qwen2_5_vl-vision.onnx"
-    vision_init_export = os.path.join(args.output, "vision_loop_export")
-    os.makedirs(vision_init_export, exist_ok=True)
-    vision_path = os.path.join(vision_init_export, filename)
+    vision_loop_export = os.path.join(args.output, "vision_loop_export")
+    os.makedirs(vision_loop_export, exist_ok=True)
+    vision_path = os.path.join(vision_loop_export, filename)
     vision_onnx_program.save(vision_path, external_data=True)
-
-    _testing.assert_onnx_program(vision_onnx_program)
-    
-    # op-level verification
-    # from torch.onnx._internal.exporter import _verification
-    # v_info = _verification.verify_onnx_program(vision_onnx_program, kwargs=dummy_inputs)
-
-    # TODO(titaiwang): We probably need to change output dimension name for image_features
-    # to match embedding model input.
+    # remove the intermediate folder
+    shutil.rmtree(vision_init_export)
 
 def build_embedding(args):
     # Dynamo export
@@ -255,7 +252,6 @@ def get_args():
 if __name__ == "__main__":
     args = get_args()
     
-
     config = Qwen2_5_VLConfig.from_pretrained(args.input)
     model = AutoModel.from_pretrained(args.input, attn_implementation="sdpa", trust_remote_code=True, torch_dtype=args.precision).to(args.execution_provider.replace("dml", "cuda"))
     
