@@ -400,7 +400,7 @@ if __name__ == "__main__":
             if debug:
                 raise
         if ok:
-            obs = compare_outputs(onnx_outputs[0], pytorch_output, "Packed MHA Attention", ep=l_EP[0])
+            obs = compare_outputs(onnx_outputs[0], pytorch_output, "Packed MHA", ep=l_EP[0])
             obs["duration"] = duration
             data.append(obs)
 
