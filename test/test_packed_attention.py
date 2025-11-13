@@ -90,10 +90,20 @@ def packed_attention(query, key, value, cu_seqlens, scale: float, num_heads: int
     padded_token_positions = op.Compress(position_matrix, padded_mask_1d)  # [total_padded_tokens]
     token_offset_1d = op.Concat(valid_token_positions, padded_token_positions, axis=0)  # [num_patches * max_length]
     token_offset = op.Reshape(token_offset_1d, position_matrix_shape)  # [num_patches, max_length]
-    packed_attn_output = msft_op.PackedMultiHeadAttention(
-        query, key, value, None, token_offset, cu_seqlens, scale=scale, num_heads=num_heads
+
+    # Convert query/key/value to shape (seq_len, num_heads* head_dim)
+    # squeeze(0) => transpose(0,1) => reshape([0, -1])
+    query_3d = op.Transpose(op.Squeeze(query, [0]), perm=[1,0,2])
+    shape_3d = op.Shape(query_3d)
+    query_2d = op.Reshape(query_3d, [0, -1])
+    key_2d = op.Reshape(op.Transpose(op.Squeeze(key, [0]), perm=[1,0,2]), [0, -1])
+    value_2d = op.Reshape(op.Transpose(op.Squeeze(value, [0]), perm=[1,0,2]), [0, -1])
+
+    packed_attn_output_2d = msft_op.PackedMultiHeadAttention(
+        query_2d, key_2d, value_2d, None, token_offset, cu_seqlens, scale=scale, num_heads=num_heads
     )
-    return packed_attn_output  # [B, seq_len, num_heads, head_dim]
+    packed_attn_output_3d = op.Reshape(packed_attn_output_2d, shape_3d)
+    return op.Unsqueeze(packed_attn_output_3d, [0])  # [B, seq_len, num_heads, head_dim]
 
 qkv_type = onnx_dtype["B", num_heads, "seq_len", head_dim]
 cu_seqlens_type = onnxscript.INT32["num_patches + 1"]
