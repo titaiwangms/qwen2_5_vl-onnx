@@ -1,3 +1,5 @@
+import os
+import time
 import onnxscript
 import onnx
 import onnx.inliner
@@ -17,6 +19,7 @@ num_heads = 2
 head_dim = 256
 qkv_type = onnxscript.FLOAT["B", num_heads, "seq_len", head_dim]
 output_type = onnxscript.FLOAT["B", "seq_len", num_heads, head_dim]
+os.makedirs("dump", exist_ok=True)
 
 
 @onnxscript.script()
@@ -191,13 +194,15 @@ def run_onnx_model(model_proto, inputs, EP, exp_name):
     """Create ONNX Runtime session and run inference."""
     # Save model to a temporary location
     dtype = inputs["query"].dtype
-    model_path = f"test_packed_attention_model_{EP[0].replace('ExecutionProvider', '').lower()}_{str(dtype)}.{exp_name}.onnx"
+    model_path = f"dump/_test_packed_attention_model_{EP[0].replace('ExecutionProvider', '').lower()}_{str(dtype)}.{exp_name}.onnx"
     onnx.save(model_proto, model_path)
     print(f"\nModel saved to {model_path}")
     
     # Create ONNX Runtime session
     session_options = ort.SessionOptions()
     session_options.optimized_model_filepath = f"{model_path}.opt.onnx"
+    session_options.enable_profiling = True
+    session_options.profile_file_prefix = f"{model_path}.profiling"
     session = ort.InferenceSession(model_path, session_options, providers=EP)
     
     # Run inference
@@ -205,14 +210,29 @@ def run_onnx_model(model_proto, inputs, EP, exp_name):
     dtype = inputs["query"].dtype
     inputs = {k: (v if v.dtype == np.int32 else v.astype(np.float32)) for k, v in inputs.items()}
     outputs = session.run(None, inputs)
+    begin = time.perf_counter()
+    for _ in range(20):
+        outputs = session.run(None, inputs)
+    duration = time.perf_counter() - begin
     outputs = [v.astype(dtype) for v in outputs]
+    prof = session.end_profiling()
+
+    # Anaylyse
+    import matplotlib.pyplot as plt
+    from onnx_diagnostic.helpers.rt_helper import js_profile_to_dataframe, plot_ort_profile
+    df = js_profile_to_dataframe(prof, first_it_out=True)
+    df.to_excel(f"{model_path}.prof.xlsx")
+    fig, ax = plt.subplots(1, 2, figsize=(12, 8))
+    plot_ort_profile(df, ax[0], ax[1], model_path)
+    fig.tight_layout()
+    fig.savefig(f"{model_path}.png")
     
     print("\nInference completed!")
     print(f"Output shape: {outputs[0].shape}")
     print(f"Output dtype: {outputs[0].dtype}")
     print(f"Output sample (first 5 values): {outputs[0].flatten()[:5]}")
     
-    return outputs
+    return outputs, duration
 
 def attention_pytorch(query_states, key_states, value_states, cu_seqlens, scaling):
     attention_interface = ALL_ATTENTION_FUNCTIONS["sdpa"]
@@ -342,19 +362,20 @@ if __name__ == "__main__":
         # Run the loop-based model with ONNX Runtime
         model_proto = make_loop_model_proto(l_np_dtype, l_scale, num_heads)
         try:
-            onnx_outputs = run_onnx_model(model_proto, inputs, l_EP, "loopMHA")
+            onnx_outputs, duration = run_onnx_model(model_proto, inputs, l_EP, "loopMHA")
             ok = True
         except ort.capi.onnxruntime_pybind11_state.NotImplemented as e:
             data.append(dict(name="Loop MHA", dtype=pytorch_output.dtype, ep=l_EP[0], ERR="NotImplemented", ERRMSG=str(e)))
             ok = False
         if ok:  
             obs = compare_outputs(onnx_outputs[0], pytorch_output, "Loop MHA", ep=l_EP[0])
+            obs["duration"] = duration
             data.append(obs)
 
         # Run the packed_mha-based model with ONNX Runtime
         model_proto = make_packed_mha_model_proto(l_np_dtype, l_scale, num_heads)
         try:
-            onnx_outputs = run_onnx_model(model_proto, inputs, l_EP, "packedMHA")
+            onnx_outputs, duration = run_onnx_model(model_proto, inputs, l_EP, "packedMHA")
             ok = True
         except ort.capi.onnxruntime_pybind11_state.NotImplemented as e:
             data.append(dict(name="Packed MHA", dtype=pytorch_output.dtype, ep=l_EP[0], ERR="NotImplemented", ERRMSG=str(e)))
@@ -367,10 +388,11 @@ if __name__ == "__main__":
             ok = False
         if ok:
             obs = compare_outputs(onnx_outputs[0], pytorch_output, "Packed MHA Attention", ep=l_EP[0])
+            obs["duration"] = duration
             data.append(obs)
 
     # final result
     df = pandas.DataFrame(data)
     print(df)
-    df.to_excel("test_packed_attention.xlsx")
+    df.to_excel("dump/test_packed_attention.xlsx")
 
