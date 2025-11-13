@@ -212,8 +212,6 @@ class Qwen2_5_VLVisionAttention(nn.Module):
         key_states = key_states.transpose(0, 1).unsqueeze(0)
         value_states = value_states.transpose(0, 1).unsqueeze(0)
 
-        cu_seqlens = cu_seqlens.to(dtype=torch.int64)
-
         attention_interface: Callable = eager_attention_forward
         if self.config._attn_implementation != "eager":
             attention_interface = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
@@ -239,8 +237,11 @@ class Qwen2_5_VLVisionAttention(nn.Module):
         elif torch.compiler.is_exporting():
             # Specifically, window attention and global attention mechanism needs to be manually
             # broke down into QKV, so GQA would not need to take cu_seqlens.
+            # NOTE: This will be replaced later with custom ONNX op for better performance.
+            #       1. LoopAttention
+            #       2. PackedMultiHeadAttention
             attn_output = torch.onnx.ops.symbolic(
-                    "custom::BatchedAttention",
+                    "custom::PackedAttention",
                     (
                         query_states,
                         key_states,
@@ -434,7 +435,7 @@ class Qwen2_5_VisionTransformerPretrainedModel(Qwen2_5_VLPreTrainedModel):
         final_window_index = index_padded[index_padded != -100]
         cu_seqlens_tmp = seqlens.cumsum(0) * self.spatial_merge_unit
         final_cu_seqlens = F.pad(cu_seqlens_tmp, (1, 0), "constant", 0)
-        return final_window_index, final_cu_seqlens
+        return final_window_index, final_cu_seqlens.to(torch.int32)
 
     def forward(self, hidden_states: torch.Tensor, grid_thw: torch.Tensor, **kwargs) -> torch.Tensor:
         """
@@ -493,7 +494,6 @@ class Qwen2_5_VisionTransformerPretrainedModel(Qwen2_5_VLPreTrainedModel):
             dtype=grid_thw.dtype if torch.jit.is_tracing() else torch.int32,
         )
         cu_seqlens = F.pad(cu_seqlens, (1, 0), value=0)
-
         for layer_num, blk in enumerate(self.blocks):
             # NOTE: Decide whether to use full attention or windowed attention
             if layer_num in self.fullatt_block_indexes:
