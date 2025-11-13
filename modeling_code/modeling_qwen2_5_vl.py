@@ -235,34 +235,34 @@ class Qwen2_5_VLVisionAttention(nn.Module):
                 **kwargs,
             )
         elif torch.compiler.is_exporting():
-            # make square mask
-            indices = torch.arange(
-                cu_seqlens.max(), dtype=cu_seqlens.dtype, device=cu_seqlens.device
-            )
-            dot = (cu_seqlens.unsqueeze(1) <= indices.unsqueeze(0)).to(
-                cu_seqlens.dtype
-            )
-            dot = dot.sum(dim=0).to(query_states.dtype)
-            mask = dot.unsqueeze(1) @ dot.unsqueeze(0)
-            bool_mask = mask == dot**2
-            bool_mask = bool_mask.unsqueeze(0).unsqueeze(0)
-            if bool_mask.device != query_states.device:
-                bool_mask = bool_mask.to(query_states.device)
-
-            torch._check(bool_mask.shape[2] == key_states.shape[2])
-            torch._check(bool_mask.shape[3] == key_states.shape[2])
-
-            attn_output, _ = attention_interface(
-                self,
-                query_states,
-                key_states,
-                value_states,
-                attention_mask=bool_mask,
-                scaling=self.scaling,
-                dropout=0.0 if not self.training else self.attention_dropout,
-                is_causal=False,
-                **kwargs,
-            )
+            # Specifically, window attention and global attention mechanism needs to be manually
+            # broke down into QKV, so GQA would not need to take cu_seqlens.
+            # NOTE: This will be replaced later with custom ONNX op for better performance.
+            #       1. LoopAttention
+            #       2. PackedMultiHeadAttention
+            attn_output = torch.onnx.ops.symbolic(
+                    "custom::PackedAttention",
+                    (
+                        query_states,
+                        key_states,
+                        value_states,
+                        cu_seqlens,
+                    ),
+                    dict(
+                        scale= self.scaling,
+                        num_heads=self.num_heads,
+                    ),
+                    dtype=query_states.dtype,
+                    shape=(
+                        query_states.shape[0],  # batch_size
+                        query_states.shape[2],  # sequence_length (total patches)
+                        query_states.shape[1],  # num_heads
+                        query_states.shape[3],  # head_size
+                    ),
+                    version=1,
+                )
+            # ONNX symbolic outputs default to CPU; move to projection weight device to prevent mixed-device addmm during torch.export
+            attn_output = attn_output.to(self.proj.weight.device)
         else:
             # Other implementations: Process each chunk separately
             lengths = cu_seqlens[1:] - cu_seqlens[:-1]
@@ -435,7 +435,7 @@ class Qwen2_5_VisionTransformerPretrainedModel(Qwen2_5_VLPreTrainedModel):
         final_window_index = index_padded[index_padded != -100]
         cu_seqlens_tmp = seqlens.cumsum(0) * self.spatial_merge_unit
         final_cu_seqlens = F.pad(cu_seqlens_tmp, (1, 0), "constant", 0)
-        return final_window_index, final_cu_seqlens
+        return final_window_index, final_cu_seqlens.to(torch.int32)
 
     def forward(self, hidden_states: torch.Tensor, grid_thw: torch.Tensor, **kwargs) -> torch.Tensor:
         """
@@ -494,7 +494,6 @@ class Qwen2_5_VisionTransformerPretrainedModel(Qwen2_5_VLPreTrainedModel):
             dtype=grid_thw.dtype if torch.jit.is_tracing() else torch.int32,
         )
         cu_seqlens = F.pad(cu_seqlens, (1, 0), value=0)
-
         for layer_num, blk in enumerate(self.blocks):
             # NOTE: Decide whether to use full attention or windowed attention
             if layer_num in self.fullatt_block_indexes:
