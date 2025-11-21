@@ -249,8 +249,10 @@ def build_vision(args):
     # remove the intermediate folder
     shutil.rmtree(vision_init_export)
 
-    # _testing.assert_onnx_program(vision_onnx_program)
+    _testing.assert_onnx_program(vision_onnx_program, atol=0.01, rtol=0.01)
 
+    # from torch.onnx._internal.exporter import _verification
+    # _verification.verify_onnx_program(vision_onnx_program, compare_intermediates=True)
 
 def build_embedding(args):
     # Dynamo export
@@ -389,6 +391,11 @@ def get_args():
         default="LoopAttention",
         help="Attention implementation to use: LoopAttention, PackedMultiHeadAttention",
     )
+    parser.add_argument(
+        "--no_weights",
+        action="store_true",
+        help="If set, do not load model weights",
+    )
 
     args = parser.parse_args()
     mapping = {
@@ -403,13 +410,35 @@ def get_args():
 if __name__ == "__main__":
     args = get_args()
 
-    config = Qwen2_5_VLConfig.from_pretrained(args.input)
-    model = AutoModel.from_pretrained(
-        args.input,
-        attn_implementation="sdpa",
-        trust_remote_code=True,
-        torch_dtype=args.precision,
-    ).to(args.execution_provider.replace("dml", "cuda"))
+    if args.no_weights:
+        # NOTE: Build model config without loading weights
+        #       Feel free to adjust model config as needed
+        config = Qwen2_5_VLConfig(
+                vision_config={
+                    "depth": 1,  # Only 1 vision layer instead of default 32
+                    # "fullatt_block_indexes": [1],
+
+                },
+                text_config={
+                    "num_hidden_layers": 4,
+                    "max_window_layers": 4,  # Adjust this too since default is 80
+                }
+        )
+        # Initialize model with random weights (no from_pretrained)
+        model = AutoModel.from_config(
+            config,
+            attn_implementation="sdpa",
+            trust_remote_code=True,
+            torch_dtype=args.precision,
+        ).to(args.execution_provider.replace("dml", "cuda"))
+    else:
+        config = Qwen2_5_VLConfig.from_pretrained(args.input)
+        model = AutoModel.from_pretrained(
+            args.input,
+            attn_implementation="sdpa",
+            trust_remote_code=True,
+            torch_dtype=args.precision,
+        ).to(args.execution_provider.replace("dml", "cuda"))
 
     # Build model components
     if args.part == "embedding":
