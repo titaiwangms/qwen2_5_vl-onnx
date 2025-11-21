@@ -214,6 +214,7 @@ def build_vision(args):
             dynamo=True,
             optimize=True,
             opset_version=22,
+            report=True
         )
 
     # apply ort_fusions
@@ -249,10 +250,21 @@ def build_vision(args):
     # remove the intermediate folder
     shutil.rmtree(vision_init_export)
 
-    _testing.assert_onnx_program(vision_onnx_program, atol=0.01, rtol=0.01)
+    # We need to compare to eager becasue the exported model contains custom ops
+    onnx_outputs = vision_onnx_program(pixel_values, grid_thw)
+    pytorch_outputs = model.eval().get_image_features(
+        pixel_values=pixel_values, image_grid_thw=grid_thw
+    )    
 
-    # from torch.onnx._internal.exporter import _verification
-    # _verification.verify_onnx_program(vision_onnx_program, compare_intermediates=True)
+    torch.testing.assert_close(
+        tuple(onnx_outputs),
+        tuple(pytorch_outputs),
+        atol=0.001,
+        rtol=0.001,
+        equal_nan=True,
+        check_device=False,
+    )
+    
 
 def build_embedding(args):
     # Dynamo export
