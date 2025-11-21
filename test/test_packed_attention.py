@@ -17,9 +17,9 @@ onnx_dtype, np_dtype, EP = [
 op = onnxscript.opset22
 msft_op = onnxscript.values.Opset("com.microsoft", 1)
 
-num_heads = 2
-head_dim = 256
-num_patches = 40
+num_heads = 16
+head_dim = 80
+num_patches = 14308
 patch_size_min = 20
 patch_size_max = 40
 
@@ -136,29 +136,54 @@ def generate_test_inputs():
     batch_size = 1
     
     # Generate random patch lengths and calculate total sequence length
-    patch_lengths = np.random.randint(patch_size_min, patch_size_max, size=num_patches, dtype=np.int64)
-    seq_len = patch_lengths.sum()
+    # Using fixed cu_seqlens, so calculate seq_len and actual num_patches from it
+    # patch_lengths = np.random.randint(patch_size_min, patch_size_max, size=num_patches, dtype=np.int64)
+    seq_len = 14308  # Last value in cu_seqlens
     
     # Generate cumulative sequence lengths: [num_patches + 1]
-    cu_seqlens = np.zeros(num_patches + 1, dtype=np.int32)
-    cu_seqlens[1:] = np.cumsum(patch_lengths)
+    cu_seqlens = torch.tensor([    0,    64,   128,   192,   256,   320,   384,   448,   512,   576,
+          640,   704,   768,   832,   896,   960,  1024,  1088,  1152,  1168,
+         1232,  1296,  1360,  1424,  1488,  1552,  1616,  1680,  1744,  1808,
+         1872,  1936,  2000,  2064,  2128,  2192,  2256,  2320,  2336,  2400,
+         2464,  2528,  2592,  2656,  2720,  2784,  2848,  2912,  2976,  3040,
+         3104,  3168,  3232,  3296,  3360,  3424,  3488,  3504,  3568,  3632,
+         3696,  3760,  3824,  3888,  3952,  4016,  4080,  4144,  4208,  4272,
+         4336,  4400,  4464,  4528,  4592,  4656,  4672,  4736,  4800,  4864,
+         4928,  4992,  5056,  5120,  5184,  5248,  5312,  5376,  5440,  5504,
+         5568,  5632,  5696,  5760,  5824,  5840,  5904,  5968,  6032,  6096,
+         6160,  6224,  6288,  6352,  6416,  6480,  6544,  6608,  6672,  6736,
+         6800,  6864,  6928,  6992,  7008,  7072,  7136,  7200,  7264,  7328,
+         7392,  7456,  7520,  7584,  7648,  7712,  7776,  7840,  7904,  7968,
+         8032,  8096,  8160,  8176,  8240,  8304,  8368,  8432,  8496,  8560,
+         8624,  8688,  8752,  8816,  8880,  8944,  9008,  9072,  9136,  9200,
+         9264,  9328,  9344,  9408,  9472,  9536,  9600,  9664,  9728,  9792,
+         9856,  9920,  9984, 10048, 10112, 10176, 10240, 10304, 10368, 10432,
+        10496, 10512, 10576, 10640, 10704, 10768, 10832, 10896, 10960, 11024,
+        11088, 11152, 11216, 11280, 11344, 11408, 11472, 11536, 11600, 11664,
+        11680, 11744, 11808, 11872, 11936, 12000, 12064, 12128, 12192, 12256,
+        12320, 12384, 12448, 12512, 12576, 12640, 12704, 12768, 12832, 12848,
+        12912, 12976, 13040, 13104, 13168, 13232, 13296, 13360, 13424, 13488,
+        13552, 13616, 13680, 13744, 13808, 13872, 13936, 14000, 14016, 14032,
+        14048, 14064, 14080, 14096, 14112, 14128, 14144, 14160, 14176, 14192,
+         14208, 14224, 14240, 14256, 14272, 14288, 14304, 14308], dtype=torch.int32)
+    cu_seqlens_np = cu_seqlens.cpu().numpy()
     
     # Generate Q, K, V tensors: [B, num_heads, seq_len, head_dim]
     query = np.random.randn(batch_size, num_heads, seq_len, head_dim).astype(np_dtype)
     key = np.random.randn(batch_size, num_heads, seq_len, head_dim).astype(np_dtype)
     value = np.random.randn(batch_size, num_heads, seq_len, head_dim).astype(np_dtype)
     
-    print(f"Generated inputs:")
+    print("Generated inputs:")
     print(f"  query shape: {query.shape}")
     print(f"  key shape: {key.shape}")
     print(f"  value shape: {value.shape}")
-    print(f"  cu_seqlens shape: {cu_seqlens.shape}, values: {cu_seqlens}")
+    print(f"  cu_seqlens shape: {cu_seqlens_np.shape}, values: {cu_seqlens}")
     
     return {
         "query": query,
         "key": key,
         "value": value,
-        "cu_seqlens": cu_seqlens
+        "cu_seqlens": cu_seqlens_np
     }
 
 def run_onnx_model(model_proto, inputs):
