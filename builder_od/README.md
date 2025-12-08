@@ -3,11 +3,11 @@
 ## requirements
 
 ```
-git+https://github.com/sdpython/experimental-experiment.git
+# git+https://github.com/sdpython/experimental-experiment.git  # optional
 huggingface_hub>=1.2.1
 onnx-diagnostic>=0.8.4
 onnxruntime>=1.23
-torch>=2.9  # weekly is better
+torch>=2.9  # nightly is better
 transformers>=4.57
 ```
 
