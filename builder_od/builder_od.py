@@ -24,6 +24,12 @@ Cheat sheet for tar commmands. To make a tar:
 And to untar:
 ``tar -xzvf model.tar.gz``.
 
+Reritings
++++++++++
+
+* `overview <https://sdpython.github.io/doc/onnx-diagnostic/dev/status/patches_diff.html#auto-patch-transformers-qwen2-5-vlforconditionalgeneration-prepare-inputs-for-generation-patched-qwen2-5-vlforconditionalgeneration-prepare-inputs-for-generation>`_
+* code: `_patch_transformers_qwen2_5.py <https://github.com/sdpython/onnx-diagnostic/blob/main/onnx_diagnostic/torch_export_patches/patches/_patch_transformers_qwen2_5.py>`_
+
 Attention
 +++++++++
 
