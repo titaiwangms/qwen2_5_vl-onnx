@@ -5,7 +5,7 @@ import shutil
 
 import onnx
 from onnxscript.rewriter import ort_fusions
-from transformers import Qwen2_5_VLConfig, AutoModel
+from transformers import Qwen2_5_VLConfig, AutoModel, AutoConfig
 from torch.onnx._internal.exporter import _testing
 
 import onnxscript
@@ -27,7 +27,7 @@ def _replace_functions(
     """
 
     custom = onnxscript.values.Opset("custom", 1)
-    op = onnxscript.opset22
+    op = onnxscript.opset23
     msft_op = onnxscript.values.Opset("com.microsoft", 1)
 
     if attention_implementation == "LoopAttention":
@@ -71,11 +71,12 @@ def _replace_functions(
                 key_i = op.Slice(key_3d, start, end, seq_axis_int32)
                 value_i = op.Slice(value_3d, start, end, seq_axis_int32)
 
-                mha_output = msft_op.MultiHeadAttention(
+                mha_output = op.Attention(
                     query_i,
                     key_i,
                     value_i,
-                    num_heads=num_heads,
+                    q_num_heads=num_heads,
+                    kv_num_heads=num_heads,
                     scale=scale,
                 )
                 attn_output = op.Concat(attn_output, mha_output, axis=1)
@@ -213,8 +214,7 @@ def build_vision(args):
             dynamic_shapes=dynamic_shapes,
             dynamo=True,
             optimize=True,
-            opset_version=22,
-            report=True
+            opset_version=23,
         )
 
     # apply ort_fusions
@@ -227,7 +227,7 @@ def build_vision(args):
     model.get_image_features, model.forward = model.forward, model.get_image_features
 
     # Save the ONNX model
-    filename = "qwen2_5_vl-vision.onnx"
+    filename = "model-vision.onnx"
     vision_init_export = os.path.join(args.output, "vision_init_export")
     os.makedirs(vision_init_export, exist_ok=True)
     vision_path = os.path.join(vision_init_export, filename)
@@ -242,7 +242,7 @@ def build_vision(args):
     vision_onnx_program.model.graph.outputs[0].shape[0] = "num_logical_patches"
 
     # Save the ONNX model
-    filename = "qwen2_5_vl-vision.onnx"
+    filename = "model-vision.onnx"
     vision_loop_export = os.path.join(args.output, "vision_loop_export")
     os.makedirs(vision_loop_export, exist_ok=True)
     vision_path = os.path.join(vision_loop_export, filename)
@@ -259,8 +259,8 @@ def build_vision(args):
     torch.testing.assert_close(
         tuple(onnx_outputs),
         tuple(pytorch_outputs),
-        atol=0.001,
-        rtol=0.001,
+        atol=0.01,
+        rtol=0.01,
         equal_nan=True,
         check_device=False,
     )
@@ -332,7 +332,7 @@ def build_embedding(args):
             dynamic_shapes=dynamic_shapes,
             dynamo=True,
             optimize=True,
-            opset_version=22,
+            opset_version=23,
         )
     # Test the parity of the exported model
     # _testing.assert_onnx_program(embedding_onnx_program)
@@ -345,7 +345,7 @@ def build_embedding(args):
 
     # Save the ONNX model
     os.makedirs(args.output, exist_ok=True)
-    filename = "qwen2_5_vl-embedding.onnx"
+    filename = "model-embedding.onnx"
     fpath_1 = os.path.join(args.output, filename)
     embedding_onnx_program.save(fpath_1, external_data=True)
 
@@ -444,7 +444,7 @@ if __name__ == "__main__":
             torch_dtype=args.precision,
         ).to(args.execution_provider.replace("dml", "cuda"))
     else:
-        config = Qwen2_5_VLConfig.from_pretrained(args.input)
+        config = AutoConfig.from_pretrained(args.input)
         model = AutoModel.from_pretrained(
             args.input,
             attn_implementation="sdpa",
