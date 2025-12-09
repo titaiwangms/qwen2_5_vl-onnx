@@ -440,7 +440,7 @@ def main(
         ]
         stat = (
             df[[*index, *values]]
-            .groupby(index)
+            .groupby(index, dropna=False)
             .agg(
                 {
                     **{c: "max" for c in values if c != "speedup"},
@@ -451,7 +451,7 @@ def main(
         stat.to_excel(statistics + ".agg.xlsx")
         stat = (
             df[df.exporter == "onnx-dynamo"][[*index, *values]]
-            .groupby(index)
+            .groupby(index, dropna=False)
             .agg(
                 {
                     **{c: "max" for c in values if c != "speedup"},
