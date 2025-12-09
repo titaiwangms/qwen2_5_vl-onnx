@@ -8,6 +8,7 @@ huggingface_hub>=1.2.1
 onnx-diagnostic>=0.8.4
 onnxruntime>=1.23
 torch>=2.9  # nightly is better
+tqdm
 transformers>=4.57
 ```
 

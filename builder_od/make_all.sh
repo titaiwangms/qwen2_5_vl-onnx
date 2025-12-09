@@ -1,10 +1,23 @@
-# cpu
-python builder_od.py -m Qwen/Qwen2.5-VL-7B-Instruct --device cpu --dtype float32 --exporter onnx-dynamo --pretrained --second-input --zip
-python builder_od.py -m microsoft/Fara-7B --device cpu --dtype float32 --exporter onnx-dynamo --pretrained --second-input --zip
+# cuda - float 16
 
-# cuda
-# python builder_od.py -m microsoft/Fara-7B --device cuda --dtype float16 --exporter custom --pretrained --second-input --zip
-QWEN25ATTENTION=PACKED python builder_od.py -m Qwen/Qwen2.5-VL-7B-Instruct --device cuda --dtype float16 --exporter onnx-dynamo --pretrained --second-input --zip
-QWEN25ATTENTION=PACKED python builder_od.py -m microsoft/Fara-7B --device cuda --dtype float16 --exporter onnx-dynamo --pretrained --second-input --zip
-QWEN25ATTENTION=LOOPMHA python builder_od.py -m microsoft/Fara-7B --device cuda --dtype float16 --exporter onnx-dynamo --pretrained --second-input --zip
+clear&&QWEN25ATTENTION=LOOPMHA python export_qwen25_vl_visual.py -m microsoft/Fara-7B --device cuda --dtype float16 --exporter onnx-dynamo --pretrained --second-input
+clear&&QWEN25ATTENTION=PACKED python export_qwen25_vl_visual.py -m microsoft/Fara-7B --device cuda --dtype float16 --exporter onnx-dynamo --pretrained --second-input
 
+clear&&QWEN25ATTENTION=LOOPMHA python export_qwen25_vl_visual.py -m Qwen/Qwen2.5-VL-7B-Instruct --device cuda --dtype float16 --exporter onnx-dynamo --pretrained --second-input
+clear&&QWEN25ATTENTION=PACKED python export_qwen25_vl_visual.py -m Qwen/Qwen2.5-VL-7B-Instruct --device cuda --dtype float16 --exporter onnx-dynamo --pretrained --second-input
+
+# cpu - float 16
+
+clear&&QWEN25ATTENTION=LOOPMHA python export_qwen25_vl_visual.py -m microsoft/Fara-7B --device cpu --dtype float16 --exporter onnx-dynamo --pretrained --second-input
+clear&&QWEN25ATTENTION=LOOPA23 python export_qwen25_vl_visual.py -m microsoft/Fara-7B --device cpu --dtype float16 --exporter onnx-dynamo --pretrained --second-input
+
+clear&&QWEN25ATTENTION=LOOPMHA python export_qwen25_vl_visual.py -m Qwen/Qwen2.5-VL-7B-Instruct --device cpu --dtype float16 --exporter onnx-dynamo --pretrained --second-input
+clear&&QWEN25ATTENTION=LOOPA23 python export_qwen25_vl_visual.py -m Qwen/Qwen2.5-VL-7B-Instruct --device cpu --dtype float16 --exporter onnx-dynamo --pretrained --second-input
+
+# cpu - float 32
+
+clear&&QWEN25ATTENTION=LOOPMHA python export_qwen25_vl_visual.py -m microsoft/Fara-7B --device cpu --dtype float32 --exporter onnx-dynamo --pretrained --second-input
+clear&&QWEN25ATTENTION=LOOPA23 python export_qwen25_vl_visual.py -m microsoft/Fara-7B --device cpu --dtype float32 --exporter onnx-dynamo --pretrained --second-input
+
+clear&&QWEN25ATTENTION=LOOPMHA python export_qwen25_vl_visual.py -m Qwen/Qwen2.5-VL-7B-Instruct --device cpu --dtype float32 --exporter onnx-dynamo --pretrained --second-input
+clear&&QWEN25ATTENTION=LOOPA23 python export_qwen25_vl_visual.py -m Qwen/Qwen2.5-VL-7B-Instruct --device cpu --dtype float32 --exporter onnx-dynamo --pretrained --second-input
