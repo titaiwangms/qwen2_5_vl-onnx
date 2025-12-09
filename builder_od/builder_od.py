@@ -97,25 +97,27 @@ def main(
     second_input: bool = True,
     make_zip: bool = False,
     output_folder: str = "dump_models",
+    existing_onnx: str | None = None,
+    part: str = "visual",
 ):
     prefix = simplify_model_id_for_a_filename(model_id)
     if "QWEN25ATTENTION" in os.environ:
         prefix = f"{prefix}.{os.environ['QWEN25ATTENTION']}"
     basename = os.path.join(
-        output_folder, f"model.{prefix}.visual.{device}.{dtype}.{exporter}"
+        output_folder, f"model.{prefix}.{part}.{device}.{dtype}.{exporter}"
     )
     filename = f"{basename}.onnx"
     stat_file = f"{basename}.stats"
 
     print("------------------------------------------------------------------")
     print(
-        f"-- {model_id} {device} {dtype} {exporter} {pretrained} "
+        f"-- {model_id} {part} {device} {dtype} {exporter} {pretrained} "
         f"{second_input} {make_zip} {output_folder} {prefix}"
     )
     print("------------------------------------------------------------------")
     print(f"-- export in {filename!r}")
 
-    if os.path.exists(stat_file):
+    if os.path.exists(stat_file) and not existing_onnx:
         print(f"-- skipping because {stat_file!r} already exists")
         return
 
@@ -185,47 +187,75 @@ def main(
     print(f"-- model.device={model.device}")
     processor = AutoProcessor.from_pretrained(model_id, use_fast=True)
     print(f"-- processor={type(processor)}")
-    model_to_export = model.visual if hasattr(model, "visual") else model.model.visual
-    print(f"-- model_to_export={type(model_to_export)}")
 
-    print("-- ############")
-    print("-- INPUT/OUTPUT")
-    print("-- ############")
+    if part == "visual":
 
-    input_filename = os.path.join(output_folder, f"inputs.{prefix}.visual.{device}.{dtype}.pt")
-    if os.path.exists(input_filename):
-        print(f"-- restore inputs from {input_filename!r}")
-        data = torch.load(input_filename)
-        export_inputs = data["export_inputs"]
-        other_inputs = data["other_inputs"]
-    else:
-        export_inputs = dict(
-            hidden_states=torch.randn((1292, 1176), dtype=torch_dtype).to(device),
-            grid_thw=torch.tensor([[1, 34, 38]], dtype=torch.int64).to(device),
+        class VisualPart(torch.nn.Module):
+            def __init__(self, model):
+                super().__init__()
+                self.model = model
+
+            def forward(self, pixel_values, image_grid_thw):
+                return model.get_image_features(pixel_values, image_grid_thw)
+
+        assert hasattr(
+            model, "get_image_features"
+        ), f"get_image_features not found in class {type(model)}"
+        model_to_export = VisualPart(model)
+
+        print(f"-- part={part!r}")
+        print(f"-- model_to_export={type(model_to_export)}")
+
+        print("-- ############")
+        print("-- INPUT/OUTPUT")
+        print("-- ############")
+
+        input_filename = os.path.join(
+            output_folder, f"inputs.{prefix}.{part}.{device}.{dtype}.pt"
         )
-        other_inputs = []
-        if second_input:
-            other_inputs = [
-                dict(
-                    hidden_states=torch.randn((1292, 1176), dtype=torch_dtype).to(device),
-                    grid_thw=torch.tensor([[1, 34, 38]], dtype=torch.int64).to(device),
-                ),
-                dict(
-                    hidden_states=torch.rand((1292, 1176), dtype=torch_dtype).to(device),
-                    grid_thw=torch.tensor([[1, 34, 38]], dtype=torch.int64).to(device),
-                ),
-                dict(
-                    hidden_states=torch.randn((14308, 1176), dtype=torch_dtype).to(device),
-                    grid_thw=torch.tensor([[1, 98, 146]], dtype=torch.int64).to(device),
-                ),
-                dict(
-                    hidden_states=torch.rand((14308, 1176), dtype=torch_dtype).to(device),
-                    grid_thw=torch.tensor([[1, 98, 146]], dtype=torch.int64).to(device),
-                ),
-            ]
-        data = dict(export_inputs=export_inputs, other_inputs=other_inputs)
-        print(f"-- dump inputs into {input_filename!r}")
-        torch.save(data, input_filename)
+        if os.path.exists(input_filename):
+            print(f"-- restore inputs from {input_filename!r}")
+            data = torch.load(input_filename)
+            export_inputs = data["export_inputs"]
+            other_inputs = data["other_inputs"]
+        else:
+            export_inputs = dict(
+                pixel_values=torch.randn((1292, 1176), dtype=torch_dtype).to(device),
+                image_grid_thw=torch.tensor([[1, 34, 38]], dtype=torch.int64).to(device),
+            )
+            other_inputs = []
+            if second_input:
+                other_inputs = [
+                    dict(
+                        pixel_values=torch.randn((1292, 1176), dtype=torch_dtype).to(device),
+                        image_grid_thw=torch.tensor([[1, 34, 38]], dtype=torch.int64).to(
+                            device
+                        ),
+                    ),
+                    dict(
+                        pixel_values=torch.rand((1292, 1176), dtype=torch_dtype).to(device),
+                        image_grid_thw=torch.tensor([[1, 34, 38]], dtype=torch.int64).to(
+                            device
+                        ),
+                    ),
+                    dict(
+                        pixel_values=torch.randn((14308, 1176), dtype=torch_dtype).to(device),
+                        image_grid_thw=torch.tensor([[1, 98, 146]], dtype=torch.int64).to(
+                            device
+                        ),
+                    ),
+                    dict(
+                        pixel_values=torch.rand((14308, 1176), dtype=torch_dtype).to(device),
+                        image_grid_thw=torch.tensor([[1, 98, 146]], dtype=torch.int64).to(
+                            device
+                        ),
+                    ),
+                ]
+            data = dict(export_inputs=export_inputs, other_inputs=other_inputs)
+            print(f"-- dump inputs into {input_filename!r}")
+            torch.save(data, input_filename)
+    else:
+        raise NotImplementedError(f"part={part!r} not implemnted yet")
 
     print(f"-- export_inputs={string_type(export_inputs, with_shape=True, with_device=True)}")
     print(f"-- other_inputs={string_type(other_inputs, with_shape=True, with_device=True)}")
@@ -278,52 +308,66 @@ def main(
         compute_expected() if not os.environ.get("STOPAT", "") else (None, None)
     )
 
-    print("-- ######")
-    print("-- EXPORT")
-    print("-- ######")
+    if existing_onnx and os.path.exists(existing_onnx):
+        exporter = existing_onnx
+        filename = existing_onnx
+        export_duration = None
+        target_opset = None
+    else:
+        print("-- ######")
+        print("-- EXPORT")
+        print("-- ######")
 
-    dynamic_shapes = dict(
-        hidden_states={0: "hidden_width", 1: "hidden_height"},
-        grid_thw={},  # {0: "n_images"}, # TODO: fix
-    )
-
-    begin = time.perf_counter()
-
-    target_opset = 22
-    if exporter == "onnx-dynamo" and device == "cuda" and "QWEN25ATTENTION" not in os.environ:
-        os.environ["QWEN25ATTENTION"] = "PACKED"
-    elif "QWEN25ATTENTION" in os.environ and os.environ["QWEN25ATTENTION"] == "LOOPA23":
-        target_opset = 23
-
-    with torch_export_patches(
-        patch_torch=False,
-        patch_sympy=False,
-        patch_transformers=True,
-        verbose=1,
-        stop_if_static=2,
-    ):
-        if export_expected is None:
-            export_expected, other_expected, durations = compute_expected()
-        to_onnx(
-            model_to_export,
-            kwargs=export_inputs,
-            dynamic_shapes=dynamic_shapes,
-            filename=filename,
-            exporter=exporter,
-            verbose=1,
-            save_ep=None,
-            target_opset=target_opset,
-            optimize=True,
-            onnx_plugs=PLUGS,
+        dynamic_shapes = dict(
+            pixel_values={0: "hidden_width", 1: "hidden_height"},
+            image_grid_thw={},  # {0: "n_images"}, # TODO: fix
         )
-    export_duration = time.perf_counter() - begin
 
-    if exporter == "onnx-dynamo":
-        # onnx-dynamo fails at producing function body with sequences as input / output.
-        # They are replaced by tensor type one step in the model.
-        print("-- remove_body_last_input_output_for_loop")
-        remove_inplace_body_last_input_output_type_for_loop(filename)
-        print("-- done.")
+        begin = time.perf_counter()
+
+        target_opset = 22
+        if (
+            exporter == "onnx-dynamo"
+            and device == "cuda"
+            and "QWEN25ATTENTION" not in os.environ
+        ):
+            os.environ["QWEN25ATTENTION"] = "PACKED"
+        elif "QWEN25ATTENTION" in os.environ and os.environ["QWEN25ATTENTION"] == "LOOPA23":
+            target_opset = 23
+
+        with torch_export_patches(
+            patch_torch=False,
+            patch_sympy=False,
+            patch_transformers=True,
+            verbose=1,
+            stop_if_static=2,
+        ):
+            if export_expected is None:
+                export_expected, other_expected, durations = compute_expected()
+            to_onnx(
+                model_to_export,
+                kwargs=export_inputs,
+                dynamic_shapes=dynamic_shapes,
+                filename=filename,
+                exporter=exporter,
+                verbose=1,
+                save_ep=None,
+                target_opset=target_opset,
+                optimize=True,
+                onnx_plugs=PLUGS,
+            )
+        export_duration = time.perf_counter() - begin
+
+        if exporter == "onnx-dynamo":
+            # onnx-dynamo fails at producing function body with sequences as input / output.
+            # They are replaced by tensor type one step in the model.
+            print("-- remove_body_last_input_output_for_loop")
+            remove_inplace_body_last_input_output_type_for_loop(filename)
+            print("-- done.")
+
+    ###############
+    # check for discrepancies
+    ###############
 
     with open(stat_file, "w") as f:
 
@@ -336,6 +380,7 @@ def main(
         if device == "cpu":
             providers = providers[1:]
         fprint(f"-- checking discrepancies with providers={providers!r}")
+        fprint(f"-- filename={filename!r}")
         sess = onnxruntime.InferenceSession(filename, providers=providers)
 
         fprint(
@@ -379,6 +424,7 @@ def main(
 
             info = {
                 "model_id": model_id,
+                "part": part,
                 "device": device,
                 "dtype": dtype,
                 "exporter": exporter,
@@ -412,23 +458,16 @@ def main(
             "timestamp",
             "model_id",
             "pretrained",
+            "part",
             "device",
             "dtype",
             "attention",
             "opset",
         ]
+        index = [*first[1:], "exporter"]
         df = df[[*first, *[c for c in df.columns if c not in set(first)]]]
         df.to_excel(statistics + ".xlsx")
 
-        index = [
-            "model_id",
-            "pretrained",
-            "device",
-            "dtype",
-            "attention",
-            "opset",
-            "exporter",
-        ]
         values = [
             "abs",
             "%>0.1",
@@ -438,26 +477,16 @@ def main(
             "latency_torch",
             "latency_ort_n",
         ]
-        stat = (
-            df[[*index, *values]]
-            .groupby(index, dropna=False)
-            .agg(
-                {
-                    **{c: "max" for c in values if c != "speedup"},
-                    "speedup": "min",
-                }
-            )
-        )
+        agg = {
+            **{c: "max" for c in values if c != "speedup"},
+            "speedup": "min",
+        }
+        stat = df[[*index, *values]].groupby(index, dropna=False).agg(agg)
         stat.to_excel(statistics + ".agg.xlsx")
         stat = (
-            df[df.exporter == "onnx-dynamo"][[*index, *values]]
+            df[df.exporter != "custom"][[*index, *values]]
             .groupby(index, dropna=False)
-            .agg(
-                {
-                    **{c: "max" for c in values if c != "speedup"},
-                    "speedup": "min",
-                }
-            )
+            .agg(agg)
         )
         stat.to_excel(statistics + ".agg.onnx-dynamo.xlsx")
 
@@ -517,6 +546,18 @@ def get_parser() -> ArgumentParser:
         help="Folders where to put the results.",
         action=BooleanOptionalAction,
     )
+    parser.add_argument(
+        "-x",
+        "--existing-onnx",
+        default="",
+        help="If an onnx file exists, only measures the disrepancies.",
+    )
+    parser.add_argument(
+        "-p",
+        "--part",
+        default="visual",
+        help="part of the model to export",
+    )
     return parser
 
 
@@ -532,4 +573,6 @@ if __name__ == "__main__":
         second_input=args.second_input,
         make_zip=args.zip,
         output_folder=args.output_folder,
+        existing_onnx=args.existing_onnx,
+        part=args.part,
     )
