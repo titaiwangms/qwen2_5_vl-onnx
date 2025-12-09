@@ -2,15 +2,17 @@
 Export visual embedding of Qwen/Qwen2.5-VL-7B-Instruct
 ======================================================
 
-requirements
+Requirements
 ++++++++++++
 
-git+https://github.com/sdpython/experimental-experiment.git
-huggingface_hub>=1.2.1
-onnx-diagnostic>=0.8.4
-onnxruntime>=1.23
-torch>=2.9  # weekly is better
-transformers>=4.57
+::
+
+    # git+https://github.com/sdpython/experimental-experiment.git
+    huggingface_hub>=1.2.1
+    onnx-diagnostic>=0.8.4
+    onnxruntime>=1.23
+    torch>=2.9  # weekly is better
+    transformers>=4.57
 
 Examples
 ++++++++
@@ -24,8 +26,8 @@ Cheat sheet for tar commmands. To make a tar:
 And to untar:
 ``tar -xzvf model.tar.gz``.
 
-Reritings
-+++++++++
+Rewritings
+++++++++++
 
 * `overview <https://sdpython.github.io/doc/onnx-diagnostic/dev/status/patches_diff.html#auto-patch-transformers-qwen2-5-vlforconditionalgeneration-prepare-inputs-for-generation-patched-qwen2-5-vlforconditionalgeneration-prepare-inputs-for-generation>`_
 * code: `_patch_transformers_qwen2_5.py <https://github.com/sdpython/onnx-diagnostic/blob/main/onnx_diagnostic/torch_export_patches/patches/_patch_transformers_qwen2_5.py>`_
@@ -229,7 +231,7 @@ def main(
         fprint(f"-- expected {string_type(expected, with_shape=True, with_device=True)}")
         feeds = {k: v.detach().cpu().numpy() for k, v in inputs.items()}
         small = sess.run(None, feeds)
-        diff = max_diff(expected, small[0], hist=[0.1])
+        diff = max_diff(expected, small[0], hist=[0.1, 0.01])
         fprint(f"-- discrepancies={diff}")
 
         if second_input:
@@ -240,7 +242,7 @@ def main(
             )
             feeds = {k: v.detach().cpu().numpy() for k, v in big_inputs.items()}
             big = sess.run(None, feeds)
-            diff = max_diff(expected_big, big[0], hist=[0.1])
+            diff = max_diff(expected_big, big[0], hist=[0.1, 0.01])
             fprint(f"-- discrepancies={diff}")
 
     if zip:
