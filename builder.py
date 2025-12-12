@@ -6,11 +6,9 @@ import shutil
 import onnx
 from onnxscript.rewriter import ort_fusions
 from transformers import Qwen2_5_VLConfig, AutoModel, AutoConfig
-from torch.onnx._internal.exporter import _testing
 
 import onnxscript
 import onnx_ir as ir
-from typing import Sequence
 import onnx_ir.passes.common as common_passes
 
 
@@ -27,7 +25,7 @@ def _replace_functions(
     """
 
     custom = onnxscript.values.Opset("custom", 1)
-    op = onnxscript.opset23
+    op = onnxscript.opset22
     msft_op = onnxscript.values.Opset("com.microsoft", 1)
 
     if attention_implementation == "LoopAttention":
@@ -71,12 +69,11 @@ def _replace_functions(
                 key_i = op.Slice(key_3d, start, end, seq_axis_int32)
                 value_i = op.Slice(value_3d, start, end, seq_axis_int32)
 
-                mha_output = op.Attention(
+                mha_output = msft_op.MultiHeadAttention(
                     query_i,
                     key_i,
                     value_i,
-                    q_num_heads=num_heads,
-                    kv_num_heads=num_heads,
+                    num_heads=num_heads,
                     scale=scale,
                 )
                 attn_output = op.Concat(attn_output, mha_output, axis=1)
@@ -214,7 +211,7 @@ def build_vision(args):
             dynamic_shapes=dynamic_shapes,
             dynamo=True,
             optimize=True,
-            opset_version=23,
+            opset_version=22,
         )
 
     # apply ort_fusions
@@ -252,9 +249,9 @@ def build_vision(args):
 
     # We need to compare to eager becasue the exported model contains custom ops
     onnx_outputs = vision_onnx_program(pixel_values, grid_thw)
-    pytorch_outputs = model.eval().get_image_features(
+    pytorch_outputs = model.get_image_features(
         pixel_values=pixel_values, image_grid_thw=grid_thw
-    )    
+    )
 
     torch.testing.assert_close(
         tuple(onnx_outputs),
@@ -332,7 +329,7 @@ def build_embedding(args):
             dynamic_shapes=dynamic_shapes,
             dynamo=True,
             optimize=True,
-            opset_version=23,
+            opset_version=22,
         )
     # Test the parity of the exported model
     # _testing.assert_onnx_program(embedding_onnx_program)
@@ -348,6 +345,20 @@ def build_embedding(args):
     filename = "model-embedding.onnx"
     fpath_1 = os.path.join(args.output, filename)
     embedding_onnx_program.save(fpath_1, external_data=True)
+
+    onnx_outputs = embedding_onnx_program(inputs["input_ids"], inputs["image_features"])
+    pytorch_outputs = model.get_fused_input_embeddings(
+        input_ids=inputs["input_ids"], image_features=inputs["image_features"]
+    )
+
+    torch.testing.assert_close(
+        tuple(onnx_outputs[0]),
+        tuple(pytorch_outputs),
+        atol=0.01,
+        rtol=0.01,
+        equal_nan=True,
+        check_device=False,
+    )
 
 
 def get_args():
@@ -442,7 +453,7 @@ if __name__ == "__main__":
             attn_implementation="sdpa",
             trust_remote_code=True,
             torch_dtype=args.precision,
-        ).to(args.execution_provider.replace("dml", "cuda"))
+        ).to(args.execution_provider.replace("dml", "cuda")).eval()
     else:
         config = AutoConfig.from_pretrained(args.input)
         model = AutoModel.from_pretrained(
@@ -450,7 +461,7 @@ if __name__ == "__main__":
             attn_implementation="sdpa",
             trust_remote_code=True,
             torch_dtype=args.precision,
-        ).to(args.execution_provider.replace("dml", "cuda"))
+        ).to(args.execution_provider.replace("dml", "cuda")).eval()
 
     # Build model components
     if args.part == "embedding":

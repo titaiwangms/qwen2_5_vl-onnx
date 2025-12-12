@@ -1258,31 +1258,16 @@ class Qwen2_5_VLModel(Qwen2_5_VLPreTrainedModel):
         Returns:
             `torch.FloatTensor`: The fused input embeddings.
         """
-        def true_fn_for_input_ids(input_ids):
-            special_image_mask = input_ids == self.config.image_token_id
-            llm_input_ids = input_ids.clone()
-            llm_input_ids[special_image_mask] = 0
-            return input_ids
-        def false_fn_for_input_ids(input_ids):
-            return input_ids
-        
-        # condition 1 on the image token index
-        llm_input_ids = torch.cond(
-            input_ids is not None and self.config.image_token_id >= self.config.text_config.vocab_size,
-            true_fn_for_input_ids,
-            false_fn_for_input_ids,
-            (input_ids, )
-        )
-    
-        inputs_embeds = self.language_model.get_input_embeddings()(llm_input_ids)
 
-        def image_features_is_none(inputs_embeds, image_features=None):
-            return inputs_embeds
+        inputs_embeds = self.get_input_embeddings()(input_ids)
+
+        def image_features_is_none(input_ids, inputs_embeds, image_features=None):
+            return inputs_embeds.clone()
         
-        def image_features_is_not_none(inputs_embeds, image_features=None):
+        def image_features_is_not_none(input_ids, inputs_embeds, image_features=None):
             # input_ids: [batch_size, seq_len]
             # input_embeds: [batch_size, seq_len, 2560 (hidden_size)]
-            special_image_mask = (llm_input_ids == self.config.image_token_id).unsqueeze(-1)
+            special_image_mask = (input_ids == self.config.image_token_id).unsqueeze(-1)
             special_image_mask = special_image_mask.expand_as(inputs_embeds).to(inputs_embeds.device)
 
             image_features = image_features.to(inputs_embeds.device, inputs_embeds.dtype)
@@ -1291,10 +1276,10 @@ class Qwen2_5_VLModel(Qwen2_5_VLPreTrainedModel):
         
         # condition 2 on the image features
         inputs_embeds = torch.cond(
-            image_features is None,
+            image_features.numel() == 0,
             image_features_is_none,
             image_features_is_not_none,
-            (inputs_embeds, image_features,)
+            (input_ids, inputs_embeds, image_features,)
         )
 
         return inputs_embeds
